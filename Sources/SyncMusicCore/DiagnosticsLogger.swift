@@ -192,8 +192,9 @@ public actor DiagnosticsLogger {
             lines.append("- Finished: \(lastRun.report.finishedAt.formatted(date: .abbreviated, time: .standard))")
             lines.append("- Duration: \(lastRun.report.durationMilliseconds) ms")
             lines.append("- Processed playlists: \(lastRun.report.processedPlaylistCount)")
+            lines.append("- Rebuilt playlist parts: \(lastRun.report.rebuiltPlaylistPartCount)")
+            lines.append("- Written tracks: \(lastRun.report.writtenTrackCount)")
             lines.append("- Playlist changes: +\(lastRun.report.createdPlaylistCount) / -\(lastRun.report.deletedPlaylistCount) / rename \(lastRun.report.renamedPlaylistCount)")
-            lines.append("- Track changes: +\(lastRun.report.addedTrackCount) / -\(lastRun.report.removedTrackCount)")
             lines.append("- Failures: \(lastRun.report.failures.count)")
 
             if !lastRun.report.failures.isEmpty {

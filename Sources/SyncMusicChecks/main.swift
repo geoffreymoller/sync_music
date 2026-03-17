@@ -1283,6 +1283,8 @@ private func runSyncOnce(trigger: SyncTrigger) async throws {
     print("runID=\(report.runID)")
     print("trigger=\(report.trigger.rawValue)")
     print("processedPlaylistCount=\(report.processedPlaylistCount)")
+    print("writtenTrackCount=\(report.writtenTrackCount)")
+    print("rebuiltPlaylistPartCount=\(report.rebuiltPlaylistPartCount)")
     print("addedTrackCount=\(report.addedTrackCount)")
     print("removedTrackCount=\(report.removedTrackCount)")
     print("createdPlaylistCount=\(report.createdPlaylistCount)")

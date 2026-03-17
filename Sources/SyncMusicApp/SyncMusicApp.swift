@@ -58,7 +58,10 @@ struct MenuContentView: View {
                     Text("Processed \(lastReport.processedPlaylistCount) playlists in \(lastReport.durationMilliseconds) ms")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Text("Tracks +\(lastReport.addedTrackCount) / -\(lastReport.removedTrackCount) • Playlists +\(lastReport.createdPlaylistCount) / -\(lastReport.deletedPlaylistCount) / rename \(lastReport.renamedPlaylistCount)")
+                    Text("Rebuilt \(lastReport.rebuiltPlaylistPartCount) parts • Wrote \(lastReport.writtenTrackCount) tracks")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Playlists +\(lastReport.createdPlaylistCount) / -\(lastReport.deletedPlaylistCount) / rename \(lastReport.renamedPlaylistCount)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -161,22 +164,22 @@ struct SettingsView: View {
             Section("Sync") {
                 Stepper(
                     value: Binding(
-                        get: { model.config.syncIntervalMinutes },
+                        get: { model.draftConfig.syncIntervalMinutes },
                         set: { newValue in
-                            model.updateConfig { $0.syncIntervalMinutes = max(1, newValue) }
+                            model.updateDraftConfig { $0.syncIntervalMinutes = max(1, newValue) }
                         }
                     ),
                     in: 1...1_440
                 ) {
-                    Text("Interval: \(model.config.syncIntervalMinutes) min")
+                    Text("Interval: \(model.draftConfig.syncIntervalMinutes) min")
                 }
 
                 TextField(
                     "Materialized Prefix",
                     text: Binding(
-                        get: { model.config.materializedPrefix },
+                        get: { model.draftConfig.materializedPrefix },
                         set: { newValue in
-                            model.updateConfig { $0.materializedPrefix = newValue.isEmpty ? "Sync Mirror" : newValue }
+                            model.updateDraftConfig { $0.materializedPrefix = newValue }
                         }
                     )
                 )
@@ -184,9 +187,9 @@ struct SettingsView: View {
                 Picker(
                     "Destination Profile",
                     selection: Binding(
-                        get: { model.config.providerProfile },
+                        get: { model.draftConfig.providerProfile },
                         set: { newValue in
-                            model.updateConfig { $0.providerProfile = newValue }
+                            model.updateDraftConfig { $0.providerProfile = newValue }
                         }
                     )
                 ) {
@@ -198,9 +201,9 @@ struct SettingsView: View {
                 Toggle(
                     "Include Apple system smart playlists",
                     isOn: Binding(
-                        get: { model.config.includeSystemSmartPlaylists },
+                        get: { model.draftConfig.includeSystemSmartPlaylists },
                         set: { newValue in
-                            model.updateConfig { $0.includeSystemSmartPlaylists = newValue }
+                            model.updateDraftConfig { $0.includeSystemSmartPlaylists = newValue }
                         }
                     )
                 )
@@ -213,14 +216,14 @@ struct SettingsView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
 
-                    ForEach(Array(model.config.sourcePlaylistExclusions.indices), id: \.self) { index in
+                    ForEach(Array(model.draftConfig.sourcePlaylistExclusions.indices), id: \.self) { index in
                         HStack(alignment: .firstTextBaseline, spacing: 8) {
                             Picker(
                                 "Match Type",
                                 selection: Binding(
-                                    get: { model.config.sourcePlaylistExclusions[index].matchType },
+                                    get: { model.draftConfig.sourcePlaylistExclusions[index].matchType },
                                     set: { newValue in
-                                        model.updateConfig { config in
+                                        model.updateDraftConfig { config in
                                             guard config.sourcePlaylistExclusions.indices.contains(index) else {
                                                 return
                                             }
@@ -239,9 +242,9 @@ struct SettingsView: View {
                             TextField(
                                 "Favorite Songs or Music",
                                 text: Binding(
-                                    get: { model.config.sourcePlaylistExclusions[index].value },
+                                    get: { model.draftConfig.sourcePlaylistExclusions[index].value },
                                     set: { newValue in
-                                        model.updateConfig { config in
+                                        model.updateDraftConfig { config in
                                             guard config.sourcePlaylistExclusions.indices.contains(index) else {
                                                 return
                                             }
@@ -252,7 +255,7 @@ struct SettingsView: View {
                             )
 
                             Button {
-                                model.updateConfig { config in
+                                model.updateDraftConfig { config in
                                     guard config.sourcePlaylistExclusions.indices.contains(index) else {
                                         return
                                     }
@@ -267,18 +270,16 @@ struct SettingsView: View {
                     }
 
                     Button("Add Exclusion Rule") {
-                        model.updateConfig {
-                            $0.sourcePlaylistExclusions.append(PlaylistExclusionRule(value: ""))
-                        }
+                        model.addDraftExclusionRule()
                     }
                 }
 
                 Toggle(
                     "Delete stale managed playlists",
                     isOn: Binding(
-                        get: { model.config.deleteStaleManagedPlaylists },
+                        get: { model.draftConfig.deleteStaleManagedPlaylists },
                         set: { newValue in
-                            model.updateConfig { $0.deleteStaleManagedPlaylists = newValue }
+                            model.updateDraftConfig { $0.deleteStaleManagedPlaylists = newValue }
                         }
                     )
                 )
@@ -288,9 +289,9 @@ struct SettingsView: View {
                 Picker(
                     "Log Level",
                     selection: Binding(
-                        get: { model.config.logLevel },
+                        get: { model.draftConfig.logLevel },
                         set: { newValue in
-                            model.updateConfig { $0.logLevel = newValue }
+                            model.updateDraftConfig { $0.logLevel = newValue }
                         }
                     )
                 ) {
@@ -302,36 +303,54 @@ struct SettingsView: View {
                 Toggle(
                     "Enable debug logging",
                     isOn: Binding(
-                        get: { model.config.debugLogging },
+                        get: { model.draftConfig.debugLogging },
                         set: { newValue in
-                            model.updateConfig { $0.debugLogging = newValue }
+                            model.updateDraftConfig { $0.debugLogging = newValue }
                         }
                     )
                 )
 
                 Stepper(
                     value: Binding(
-                        get: { model.config.maxRotatedLogFiles },
+                        get: { model.draftConfig.maxRotatedLogFiles },
                         set: { newValue in
-                            model.updateConfig { $0.maxRotatedLogFiles = max(1, newValue) }
+                            model.updateDraftConfig { $0.maxRotatedLogFiles = max(1, newValue) }
                         }
                     ),
                     in: 1...20
                 ) {
-                    Text("Rotated log files: \(model.config.maxRotatedLogFiles)")
+                    Text("Rotated log files: \(model.draftConfig.maxRotatedLogFiles)")
                 }
 
                 Stepper(
                     value: Binding(
-                        get: { model.config.maxLogFileSizeBytes / 1_000_000 },
+                        get: { model.draftConfig.maxLogFileSizeBytes / 1_000_000 },
                         set: { newValue in
-                            model.updateConfig { $0.maxLogFileSizeBytes = max(1, newValue) * 1_000_000 }
+                            model.updateDraftConfig { $0.maxLogFileSizeBytes = max(1, newValue) * 1_000_000 }
                         }
                     ),
                     in: 1...20
                 ) {
-                    Text("Per-log size: \(model.config.maxLogFileSizeBytes / 1_000_000) MB")
+                    Text("Per-log size: \(model.draftConfig.maxLogFileSizeBytes / 1_000_000) MB")
                 }
+            }
+
+            Section("Pending Changes") {
+                HStack {
+                    Button("Apply") {
+                        model.applyConfigChanges()
+                    }
+                    .disabled(model.hasPendingConfigChanges == false)
+
+                    Button("Revert") {
+                        model.revertConfigChanges()
+                    }
+                    .disabled(model.hasPendingConfigChanges == false)
+                }
+
+                Text(model.hasPendingConfigChanges ? "Settings changes are staged locally until you apply them." : "No pending settings changes.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("App") {
@@ -368,14 +387,17 @@ struct SettingsView: View {
 @main
 struct SyncMusicApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var model = AppModel()
+    @StateObject private var model: AppModel
+
+    init() {
+        let model = AppModel()
+        _model = StateObject(wrappedValue: model)
+        model.startIfNeeded()
+    }
 
     var body: some Scene {
         MenuBarExtra {
             MenuContentView(model: model)
-                .task {
-                    model.start()
-                }
         } label: {
             Label(model.menuBarTitle, systemImage: model.menuBarSymbolName)
         }

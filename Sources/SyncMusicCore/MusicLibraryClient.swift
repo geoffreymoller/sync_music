@@ -1,15 +1,5 @@
 import Foundation
 
-public struct EnsuredPlaylist: Sendable {
-    public let persistentID: String
-    public let wasCreated: Bool
-
-    public init(persistentID: String, wasCreated: Bool) {
-        self.persistentID = persistentID
-        self.wasCreated = wasCreated
-    }
-}
-
 public final class MusicLibraryClient: @unchecked Sendable {
     private let runner: OsaScriptRunner
     private let diagnostics: DiagnosticsLogger
@@ -140,21 +130,52 @@ public final class MusicLibraryClient: @unchecked Sendable {
         return snapshot
     }
 
-    public func ensureUserPlaylist(
+    public func playlistName(
+        persistentID: String,
+        runContext: RunContext?,
+        sourcePlaylistName: String? = nil,
+        targetPlaylistName: String? = nil
+    ) async throws -> String {
+        let result = try await runMusicScript(
+            operation: "music.playlistName",
+            script: playlistNameScript,
+            arguments: [persistentID],
+            runContext: runContext,
+            sourcePlaylistName: sourcePlaylistName,
+            targetPlaylistName: targetPlaylistName,
+            targetPlaylistPersistentID: persistentID,
+            messageOnSuccess: "Resolved materialized playlist name."
+        )
+
+        let resolvedName = result.stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard resolvedName.isEmpty == false else {
+            let message = "Music did not return playlist \(persistentID)."
+            throw OsaScriptError(
+                operation: "music.playlistName",
+                terminationStatus: -1,
+                stdoutText: result.stdoutText,
+                stderrText: message,
+                durationMilliseconds: result.durationMilliseconds
+            )
+        }
+        return resolvedName
+    }
+
+    public func createUserPlaylist(
         named name: String,
         runContext: RunContext?,
         sourcePlaylistName: String? = nil
-    ) async throws -> EnsuredPlaylist {
+    ) async throws -> String {
         let result = try await runMusicScript(
-            operation: "music.ensureUserPlaylist",
-            script: ensurePlaylistScript,
+            operation: "music.createUserPlaylist",
+            script: createPlaylistScript,
             arguments: [name],
             runContext: runContext,
             sourcePlaylistName: sourcePlaylistName,
             targetPlaylistName: name,
-            messageOnSuccess: "Ensured materialized playlist exists."
+            messageOnSuccess: "Created materialized playlist."
         )
-        return parseEnsuredPlaylist(result.stdoutText)
+        return result.stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     public func renamePlaylist(
@@ -370,22 +391,6 @@ public final class MusicLibraryClient: @unchecked Sendable {
             }
     }
 
-    private func parseEnsuredPlaylist(_ output: String) -> EnsuredPlaylist {
-        let fields = output.split(separator: Character(unitSeparator), omittingEmptySubsequences: false)
-        guard let persistentIDField = fields.first, persistentIDField.isEmpty == false else {
-            return EnsuredPlaylist(
-                persistentID: output.trimmingCharacters(in: .whitespacesAndNewlines),
-                wasCreated: false
-            )
-        }
-
-        let wasCreated = fields.count >= 2 && String(fields[1]).lowercased() == "true"
-        return EnsuredPlaylist(
-            persistentID: String(persistentIDField),
-            wasCreated: wasCreated
-        )
-    }
-
     private func truncate(_ value: String, maximumLength: Int = 240) -> String? {
         guard !value.isEmpty else {
             return nil
@@ -520,7 +525,7 @@ public final class MusicLibraryClient: @unchecked Sendable {
         """
     }
 
-    private var ensurePlaylistScript: String {
+    private var createPlaylistScript: String {
         """
         use AppleScript version "2.4"
         use scripting additions
@@ -528,25 +533,32 @@ public final class MusicLibraryClient: @unchecked Sendable {
 
         on run argv
             set targetName to item 1 of argv
-            set unitSep to character id 31
+            tell application "Music"
+                set createdPlaylist to make new user playlist with properties {name:targetName}
+                return persistent ID of createdPlaylist as text
+            end tell
+        end run
+        """
+    }
+
+    private var playlistNameScript: String {
+        """
+        use AppleScript version "2.4"
+        use scripting additions
+        \(sharedHelpers)
+
+        on run argv
+            set targetID to item 1 of argv
             tell application "Music"
                 repeat with candidatePlaylist in every playlist
                     try
-                        if (class of candidatePlaylist is user playlist) and ((name of candidatePlaylist as text) is targetName) then
-                            set isSmartPlaylist to false
-                            try
-                                set isSmartPlaylist to smart of candidatePlaylist
-                            end try
-                            if isSmartPlaylist is false then
-                                return (persistent ID of candidatePlaylist as text) & unitSep & "false"
-                            end if
+                        if (persistent ID of candidatePlaylist as text) is targetID then
+                            return name of candidatePlaylist as text
                         end if
                     end try
                 end repeat
-
-                set createdPlaylist to make new user playlist with properties {name:targetName}
-                return (persistent ID of createdPlaylist as text) & unitSep & "true"
             end tell
+            error "Playlist not found: " & targetID
         end run
         """
     }

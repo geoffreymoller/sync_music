@@ -6,6 +6,8 @@ import SyncMusicCore
 @MainActor
 final class AppModel: ObservableObject {
     @Published var config: AppConfig
+    @Published var draftConfig: AppConfig
+    @Published var hasPendingConfigChanges = false
     @Published var managedPlaylists: [ManagedPlaylistState] = []
     @Published var statusText = "Idle"
     @Published var currentStepText = "No sync running."
@@ -24,14 +26,21 @@ final class AppModel: ObservableObject {
 
     private let engine: SyncEngine
     private var schedulerTask: Task<Void, Never>?
+    private var hasStarted = false
 
     init() {
         let diagnostics = DiagnosticsLogger()
         self.engine = SyncEngine(diagnostics: diagnostics)
-        self.config = AppConfig()
+        let initialConfig = AppConfig()
+        self.config = initialConfig
+        self.draftConfig = initialConfig
     }
 
-    func start() {
+    func startIfNeeded() {
+        guard hasStarted == false else {
+            return
+        }
+        hasStarted = true
         Task {
             let loadedConfig = await engine.loadConfig()
             let loadedState = await engine.loadState()
@@ -39,6 +48,8 @@ final class AppModel: ObservableObject {
             let crashContext = await engine.loadCrashContext()
 
             config = loadedConfig
+            draftConfig = loadedConfig
+            hasPendingConfigChanges = false
             applyState(loadedState)
             lastReport = lastSnapshot?.report
             recentFailures = Array(lastSnapshot?.report.failures.prefix(5) ?? [])
@@ -55,7 +66,7 @@ final class AppModel: ObservableObject {
             }
 
             refreshLaunchAtLoginState()
-            restartScheduler()
+            restartScheduler(runStartupSync: true)
         }
     }
 
@@ -65,18 +76,50 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func updateConfig(_ mutate: (inout AppConfig) -> Void) {
-        mutate(&config)
+    func updateDraftConfig(_ mutate: (inout AppConfig) -> Void) {
+        mutate(&draftConfig)
+        hasPendingConfigChanges = draftConfig != config
+    }
+
+    func addDraftExclusionRule() {
+        updateDraftConfig {
+            $0.sourcePlaylistExclusions.append(PlaylistExclusionRule(value: ""))
+        }
+    }
+
+    func applyConfigChanges() {
+        let normalized = normalizedConfig(from: draftConfig)
+        let previousConfig = config
+        draftConfig = normalized
+
+        guard normalized != previousConfig else {
+            hasPendingConfigChanges = false
+            statusText = "No settings changes to apply."
+            return
+        }
 
         Task {
             do {
-                try await engine.saveConfig(config)
-                restartScheduler()
+                try await engine.saveConfig(normalized)
+                config = normalized
+                hasPendingConfigChanges = false
+
+                if normalized.syncIntervalMinutes != previousConfig.syncIntervalMinutes {
+                    restartScheduler(runStartupSync: false)
+                }
+
                 statusText = "Saved settings."
             } catch {
+                hasPendingConfigChanges = true
                 statusText = "Failed saving config: \(error.localizedDescription)"
             }
         }
+    }
+
+    func revertConfigChanges() {
+        draftConfig = config
+        hasPendingConfigChanges = false
+        statusText = "Reverted pending settings."
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
@@ -210,14 +253,19 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func restartScheduler() {
+    private func restartScheduler(runStartupSync: Bool) {
         schedulerTask?.cancel()
         schedulerTask = Task {
-            await runSync(trigger: .startup, reason: "Startup sync")
+            if runStartupSync {
+                await runSync(trigger: .startup, reason: "Startup sync")
+            }
 
             while !Task.isCancelled {
                 let seconds = max(1, config.syncIntervalMinutes) * 60
                 try? await Task.sleep(for: .seconds(seconds))
+                guard !Task.isCancelled else {
+                    break
+                }
                 await runSync(trigger: .scheduled, reason: "Scheduled sync")
             }
         }
@@ -294,5 +342,14 @@ final class AppModel: ObservableObject {
         activeProgressStage = nil
         activeProcessedPlaylistCount = 0
         activeCurrentPlaylistName = nil
+    }
+
+    private func normalizedConfig(from candidate: AppConfig) -> AppConfig {
+        var normalized = candidate
+        normalized.syncIntervalMinutes = max(1, normalized.syncIntervalMinutes)
+        if normalized.materializedPrefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            normalized.materializedPrefix = "Sync Mirror"
+        }
+        return normalized
     }
 }

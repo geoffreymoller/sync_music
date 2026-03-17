@@ -48,6 +48,7 @@ public struct ManagedPlaylistState: Codable, Equatable, Identifiable, Sendable {
     public var sourcePersistentID: String
     public var sourceName: String
     public var parts: [ManagedPlaylistPart]
+    public var lastSourceFingerprint: String?
     public var lastSyncedAt: Date?
     public var lastError: String?
     public var lastFailureCategory: FailureCategory?
@@ -57,6 +58,7 @@ public struct ManagedPlaylistState: Codable, Equatable, Identifiable, Sendable {
         sourcePersistentID: String,
         sourceName: String,
         parts: [ManagedPlaylistPart] = [],
+        lastSourceFingerprint: String? = nil,
         lastSyncedAt: Date? = nil,
         lastError: String? = nil,
         lastFailureCategory: FailureCategory? = nil,
@@ -65,6 +67,7 @@ public struct ManagedPlaylistState: Codable, Equatable, Identifiable, Sendable {
         self.sourcePersistentID = sourcePersistentID
         self.sourceName = sourceName
         self.parts = parts
+        self.lastSourceFingerprint = lastSourceFingerprint
         self.lastSyncedAt = lastSyncedAt
         self.lastError = lastError
         self.lastFailureCategory = lastFailureCategory
@@ -413,6 +416,8 @@ public struct SyncRunReport: Codable, Equatable, Sendable {
     public let startedAt: Date
     public let finishedAt: Date
     public let processedPlaylistCount: Int
+    public let writtenTrackCount: Int
+    public let rebuiltPlaylistPartCount: Int
     public let addedTrackCount: Int
     public let removedTrackCount: Int
     public let createdPlaylistCount: Int
@@ -426,6 +431,8 @@ public struct SyncRunReport: Codable, Equatable, Sendable {
         startedAt: Date,
         finishedAt: Date,
         processedPlaylistCount: Int,
+        writtenTrackCount: Int,
+        rebuiltPlaylistPartCount: Int,
         addedTrackCount: Int,
         removedTrackCount: Int,
         createdPlaylistCount: Int,
@@ -438,6 +445,8 @@ public struct SyncRunReport: Codable, Equatable, Sendable {
         self.startedAt = startedAt
         self.finishedAt = finishedAt
         self.processedPlaylistCount = processedPlaylistCount
+        self.writtenTrackCount = writtenTrackCount
+        self.rebuiltPlaylistPartCount = rebuiltPlaylistPartCount
         self.addedTrackCount = addedTrackCount
         self.removedTrackCount = removedTrackCount
         self.createdPlaylistCount = createdPlaylistCount
@@ -452,6 +461,56 @@ public struct SyncRunReport: Codable, Equatable, Sendable {
 
     public var durationMilliseconds: Int {
         Int(finishedAt.timeIntervalSince(startedAt) * 1_000)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case runID
+        case trigger
+        case startedAt
+        case finishedAt
+        case processedPlaylistCount
+        case writtenTrackCount
+        case rebuiltPlaylistPartCount
+        case addedTrackCount
+        case removedTrackCount
+        case createdPlaylistCount
+        case deletedPlaylistCount
+        case renamedPlaylistCount
+        case failures
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        runID = try container.decode(String.self, forKey: .runID)
+        trigger = try container.decode(SyncTrigger.self, forKey: .trigger)
+        startedAt = try container.decode(Date.self, forKey: .startedAt)
+        finishedAt = try container.decode(Date.self, forKey: .finishedAt)
+        processedPlaylistCount = try container.decode(Int.self, forKey: .processedPlaylistCount)
+        writtenTrackCount = try container.decodeIfPresent(Int.self, forKey: .writtenTrackCount) ?? 0
+        rebuiltPlaylistPartCount = try container.decodeIfPresent(Int.self, forKey: .rebuiltPlaylistPartCount) ?? 0
+        addedTrackCount = try container.decodeIfPresent(Int.self, forKey: .addedTrackCount) ?? 0
+        removedTrackCount = try container.decodeIfPresent(Int.self, forKey: .removedTrackCount) ?? 0
+        createdPlaylistCount = try container.decode(Int.self, forKey: .createdPlaylistCount)
+        deletedPlaylistCount = try container.decode(Int.self, forKey: .deletedPlaylistCount)
+        renamedPlaylistCount = try container.decode(Int.self, forKey: .renamedPlaylistCount)
+        failures = try container.decode([SyncFailure].self, forKey: .failures)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(runID, forKey: .runID)
+        try container.encode(trigger, forKey: .trigger)
+        try container.encode(startedAt, forKey: .startedAt)
+        try container.encode(finishedAt, forKey: .finishedAt)
+        try container.encode(processedPlaylistCount, forKey: .processedPlaylistCount)
+        try container.encode(writtenTrackCount, forKey: .writtenTrackCount)
+        try container.encode(rebuiltPlaylistPartCount, forKey: .rebuiltPlaylistPartCount)
+        try container.encode(addedTrackCount, forKey: .addedTrackCount)
+        try container.encode(removedTrackCount, forKey: .removedTrackCount)
+        try container.encode(createdPlaylistCount, forKey: .createdPlaylistCount)
+        try container.encode(deletedPlaylistCount, forKey: .deletedPlaylistCount)
+        try container.encode(renamedPlaylistCount, forKey: .renamedPlaylistCount)
+        try container.encode(failures, forKey: .failures)
     }
 }
 
@@ -532,6 +591,8 @@ public struct SyncEvent: Codable, Identifiable, Sendable {
     public let partIndex: Int?
     public let totalParts: Int?
     public let trackCount: Int?
+    public let writtenTrackCount: Int?
+    public let rebuiltPlaylistPartCount: Int?
     public let addedTrackCount: Int?
     public let removedTrackCount: Int?
     public let durationMilliseconds: Int?
@@ -556,6 +617,8 @@ public struct SyncEvent: Codable, Identifiable, Sendable {
         partIndex: Int? = nil,
         totalParts: Int? = nil,
         trackCount: Int? = nil,
+        writtenTrackCount: Int? = nil,
+        rebuiltPlaylistPartCount: Int? = nil,
         addedTrackCount: Int? = nil,
         removedTrackCount: Int? = nil,
         durationMilliseconds: Int? = nil,
@@ -579,6 +642,8 @@ public struct SyncEvent: Codable, Identifiable, Sendable {
         self.partIndex = partIndex
         self.totalParts = totalParts
         self.trackCount = trackCount
+        self.writtenTrackCount = writtenTrackCount
+        self.rebuiltPlaylistPartCount = rebuiltPlaylistPartCount
         self.addedTrackCount = addedTrackCount
         self.removedTrackCount = removedTrackCount
         self.durationMilliseconds = durationMilliseconds

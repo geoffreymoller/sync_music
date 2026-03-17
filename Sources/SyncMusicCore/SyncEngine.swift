@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public actor SyncEngine {
@@ -178,8 +179,10 @@ public actor SyncEngine {
         )
 
         var processedPlaylistCount = 0
-        var addedTrackCount = 0
-        var removedTrackCount = 0
+        var writtenTrackCount = 0
+        var rebuiltPlaylistPartCount = 0
+        let addedTrackCount = 0
+        let removedTrackCount = 0
         var createdPlaylistCount = 0
         var deletedPlaylistCount = 0
         var renamedPlaylistCount = 0
@@ -202,6 +205,8 @@ public actor SyncEngine {
                 startedAt: startedAt,
                 finishedAt: Date(),
                 processedPlaylistCount: 0,
+                writtenTrackCount: 0,
+                rebuiltPlaylistPartCount: 0,
                 addedTrackCount: 0,
                 removedTrackCount: 0,
                 createdPlaylistCount: 0,
@@ -251,6 +256,8 @@ public actor SyncEngine {
                 startedAt: startedAt,
                 finishedAt: Date(),
                 processedPlaylistCount: 0,
+                writtenTrackCount: 0,
+                rebuiltPlaylistPartCount: 0,
                 addedTrackCount: 0,
                 removedTrackCount: 0,
                 createdPlaylistCount: 0,
@@ -305,8 +312,21 @@ public actor SyncEngine {
             )
         }
 
-        var sourcePlaylists: [PlaylistSnapshot] = []
-        sourcePlaylists.reserveCapacity(sourcePlaylistMetadata.count)
+        await diagnostics.log(
+            SyncEvent(
+                level: .info,
+                subsystem: "sync",
+                operation: "sync.discoverPlaylists",
+                runID: runContext.runID,
+                trigger: trigger,
+                message: "Ready to reconcile \(sourcePlaylistMetadata.count) smart playlists.",
+                metadata: [
+                    "playlistCount": "\(sourcePlaylistMetadata.count)",
+                    "excludedByRuleCount": "\(playlistEvaluation.excludedByRules.count)",
+                    "excludedBySystemCount": "\(playlistEvaluation.excludedBySystemFilter.count)",
+                ]
+            )
+        )
 
         for sourceMetadata in sourcePlaylistMetadata {
             await progress(
@@ -320,13 +340,13 @@ public actor SyncEngine {
                 )
             )
 
+            let source: PlaylistSnapshot
             do {
-                let snapshot = try await musicClient.snapshotUserPlaylist(
+                source = try await musicClient.snapshotUserPlaylist(
                     persistentID: sourceMetadata.persistentID,
                     runContext: runContext,
                     sourcePlaylistName: sourceMetadata.name
                 )
-                sourcePlaylists.append(snapshot)
             } catch {
                 let failure = makeFailure(
                     playlistName: sourceMetadata.name,
@@ -349,26 +369,10 @@ public actor SyncEngine {
                         errorMessage: failure.underlyingMessage
                     )
                 )
+                processedPlaylistCount += 1
+                continue
             }
-        }
 
-        await diagnostics.log(
-            SyncEvent(
-                level: .info,
-                subsystem: "sync",
-                operation: "sync.discoverPlaylists",
-                runID: runContext.runID,
-                trigger: trigger,
-                message: "Ready to reconcile \(sourcePlaylists.count) smart playlists.",
-                metadata: [
-                    "playlistCount": "\(sourcePlaylists.count)",
-                    "excludedByRuleCount": "\(playlistEvaluation.excludedByRules.count)",
-                    "excludedBySystemCount": "\(playlistEvaluation.excludedBySystemFilter.count)",
-                ]
-            )
-        )
-
-        for source in sourcePlaylists {
             var managed = state.managedPlaylists[source.persistentID] ?? ManagedPlaylistState(
                 sourcePersistentID: source.persistentID,
                 sourceName: source.name
@@ -411,6 +415,9 @@ public actor SyncEngine {
                     sourceName: source.name,
                     partCount: desiredChunks.count
                 )
+                let sourceFingerprint = fingerprint(for: source, desiredNames: desiredNames)
+                let sourceHasChanged = managed.lastSourceFingerprint != sourceFingerprint
+                    || managed.parts.count != desiredNames.count
 
                 var updatedParts: [ManagedPlaylistPart] = []
                 var nextSourceTrackStartIndex = 1
@@ -421,18 +428,18 @@ public actor SyncEngine {
                     let sourceTrackEndIndex = sourceTrackStartIndex + trackChunk.count - 1
                     let existingPart = managed.parts.first { $0.index == index }
                     var targetPersistentID: String
-                    var targetTrackIDs: [String]?
-                    var rebuildMode: String?
+                    var shouldReplaceContents = sourceHasChanged
+                    var rebuildMode: String? = sourceHasChanged ? "sourceChanged" : nil
 
                     if let existingPart {
                         do {
-                            let existingSnapshot = try await musicClient.snapshotUserPlaylist(
+                            let currentTargetName = try await musicClient.playlistName(
                                 persistentID: existingPart.targetPersistentID,
                                 runContext: runContext,
                                 sourcePlaylistName: source.name,
                                 targetPlaylistName: existingPart.targetName
                             )
-                            if existingSnapshot.name != desiredName {
+                            if currentTargetName != desiredName {
                                 try await musicClient.renamePlaylist(
                                     persistentID: existingPart.targetPersistentID,
                                     newName: desiredName,
@@ -442,30 +449,29 @@ public actor SyncEngine {
                                 renamedPlaylistCount += 1
                             }
                             targetPersistentID = existingPart.targetPersistentID
-                            targetTrackIDs = existingSnapshot.trackPersistentIDs
                         } catch {
-                            let ensuredTarget = try await musicClient.ensureUserPlaylist(
+                            let targetCreationCategory = recoveryCategory(for: error)
+                            guard targetCreationCategory == .playlistLookupFailed else {
+                                throw error
+                            }
+
+                            targetPersistentID = try await musicClient.createUserPlaylist(
                                 named: desiredName,
                                 runContext: runContext,
                                 sourcePlaylistName: source.name
                             )
-                            if ensuredTarget.wasCreated {
-                                createdPlaylistCount += 1
-                                targetTrackIDs = []
-                            } else {
-                                targetTrackIDs = nil
-                            }
-                            targetPersistentID = ensuredTarget.persistentID
-                            rebuildMode = "snapshotFallback"
+                            createdPlaylistCount += 1
+                            shouldReplaceContents = true
+                            rebuildMode = "recreatedMissingTarget"
 
                             await diagnostics.log(
                                 SyncEvent(
                                     level: .warning,
                                     subsystem: "sync",
-                                    operation: "sync.targetSnapshotFallback",
+                                    operation: "sync.recreateMissingTarget",
                                     runID: runContext.runID,
                                     trigger: trigger,
-                                    message: "Target snapshot failed; forcing materialized playlist rebuild.",
+                                    message: "Managed target lookup failed; creating a fresh materialized playlist.",
                                     sourcePlaylistName: source.name,
                                     sourcePlaylistPersistentID: source.persistentID,
                                     targetPlaylistName: desiredName,
@@ -473,35 +479,25 @@ public actor SyncEngine {
                                     partIndex: index,
                                     totalParts: desiredChunks.count,
                                     trackCount: trackChunk.count,
-                                    errorCategory: recoveryCategory(for: error),
+                                    errorCategory: targetCreationCategory,
                                     errorMessage: recoveryMessage(for: error),
                                     metadata: [
-                                        "recovery": "forceRebuild",
-                                        "targetWasCreated": ensuredTarget.wasCreated ? "true" : "false",
+                                        "recovery": "createNewTarget",
                                     ]
                                 )
                             )
                         }
                     } else {
-                        let ensuredTarget = try await musicClient.ensureUserPlaylist(
+                        targetPersistentID = try await musicClient.createUserPlaylist(
                             named: desiredName,
                             runContext: runContext,
                             sourcePlaylistName: source.name
                         )
-                        if ensuredTarget.wasCreated {
-                            createdPlaylistCount += 1
-                            targetTrackIDs = []
-                        } else {
-                            targetTrackIDs = nil
-                        }
-                        targetPersistentID = ensuredTarget.persistentID
-                        rebuildMode = "missingPart"
+                        createdPlaylistCount += 1
+                        shouldReplaceContents = true
+                        rebuildMode = "newPart"
                     }
 
-                    let diff = targetTrackIDs.map {
-                        SyncPlanner.diff(source: trackChunk, target: $0)
-                    }
-                    let shouldReplaceContents = rebuildMode != nil || targetTrackIDs != trackChunk
                     if shouldReplaceContents {
                         try await musicClient.replacePlaylistContents(
                             sourcePlaylistPersistentID: source.persistentID,
@@ -515,19 +511,13 @@ public actor SyncEngine {
                             partIndex: index,
                             totalParts: desiredChunks.count
                         )
-                    }
-
-                    if let diff {
-                        addedTrackCount += diff.toAdd.count
-                        removedTrackCount += diff.toRemove.count
+                        writtenTrackCount += trackChunk.count
+                        rebuiltPlaylistPartCount += 1
                     }
 
                     var reconcileMetadata: [String: String] = [:]
                     if let rebuildMode {
                         reconcileMetadata["rebuildMode"] = rebuildMode
-                    }
-                    if diff == nil {
-                        reconcileMetadata["diffAvailable"] = "false"
                     }
 
                     await diagnostics.log(
@@ -547,8 +537,8 @@ public actor SyncEngine {
                             partIndex: index,
                             totalParts: desiredChunks.count,
                             trackCount: trackChunk.count,
-                            addedTrackCount: diff?.toAdd.count,
-                            removedTrackCount: diff?.toRemove.count,
+                            writtenTrackCount: shouldReplaceContents ? trackChunk.count : 0,
+                            rebuiltPlaylistPartCount: shouldReplaceContents ? 1 : 0,
                             metadata: reconcileMetadata.isEmpty ? nil : reconcileMetadata
                         )
                     )
@@ -622,6 +612,7 @@ public actor SyncEngine {
                 }
 
                 managed.parts = updatedParts.sorted { $0.index < $1.index }
+                managed.lastSourceFingerprint = sourceFingerprint
                 managed.lastSyncedAt = Date()
                 managed.lastError = nil
                 managed.lastFailureCategory = nil
@@ -673,6 +664,29 @@ public actor SyncEngine {
                 )
             }
 
+            do {
+                try store.saveState(state)
+            } catch {
+                let checkpointFailure = makeFailure(
+                    playlistName: source.name,
+                    operation: "state.saveCheckpoint",
+                    error: error
+                )
+                failures.append(checkpointFailure)
+                await diagnostics.log(
+                    SyncEvent(
+                        level: .error,
+                        subsystem: "state",
+                        operation: "state.saveCheckpoint",
+                        runID: runContext.runID,
+                        trigger: trigger,
+                        message: checkpointFailure.message,
+                        sourcePlaylistName: source.name,
+                        errorCategory: checkpointFailure.category,
+                        errorMessage: checkpointFailure.underlyingMessage
+                    )
+                )
+            }
             processedPlaylistCount += 1
         }
 
@@ -791,6 +805,8 @@ public actor SyncEngine {
             startedAt: startedAt,
             finishedAt: Date(),
             processedPlaylistCount: processedPlaylistCount,
+            writtenTrackCount: writtenTrackCount,
+            rebuiltPlaylistPartCount: rebuiltPlaylistPartCount,
             addedTrackCount: addedTrackCount,
             removedTrackCount: removedTrackCount,
             createdPlaylistCount: createdPlaylistCount,
@@ -819,12 +835,16 @@ public actor SyncEngine {
                 runID: report.runID,
                 trigger: report.trigger,
                 message: report.failures.isEmpty ? "Sync run completed successfully." : "Sync run completed with \(report.failures.count) issue(s).",
+                writtenTrackCount: report.writtenTrackCount,
+                rebuiltPlaylistPartCount: report.rebuiltPlaylistPartCount,
                 addedTrackCount: report.addedTrackCount,
                 removedTrackCount: report.removedTrackCount,
                 durationMilliseconds: report.durationMilliseconds,
                 metadata: [
                     "processedPlaylistCount": "\(report.processedPlaylistCount)",
                     "failureCount": "\(report.failures.count)",
+                    "writtenTrackCount": "\(report.writtenTrackCount)",
+                    "rebuiltPlaylistPartCount": "\(report.rebuiltPlaylistPartCount)",
                 ]
             )
         )
@@ -892,5 +912,12 @@ public actor SyncEngine {
         default:
             return error.localizedDescription
         }
+    }
+
+    private func fingerprint(for source: PlaylistSnapshot, desiredNames: [String]) -> String {
+        let payload = ([source.name, source.persistentID] + desiredNames + source.trackPersistentIDs)
+            .joined(separator: "\u{001F}")
+        let digest = SHA256.hash(data: Data(payload.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 }
