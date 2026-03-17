@@ -1,0 +1,896 @@
+import Foundation
+
+public actor SyncEngine {
+    private let store: StateStore
+    private let musicClient: MusicLibraryClient
+    private let diagnostics: DiagnosticsLogger
+
+    public init(
+        store: StateStore = StateStore(),
+        diagnostics: DiagnosticsLogger = DiagnosticsLogger(),
+        musicClient: MusicLibraryClient? = nil
+    ) {
+        self.store = store
+        self.diagnostics = diagnostics
+        self.musicClient = musicClient ?? MusicLibraryClient(diagnostics: diagnostics)
+    }
+
+    public func loadConfig() async -> AppConfig {
+        do {
+            let config = try store.loadConfig()
+            await diagnostics.updateConfig(config)
+            return config
+        } catch {
+            let fallback = AppConfig()
+            await diagnostics.updateConfig(fallback)
+            await diagnostics.log(
+                SyncEvent(
+                    level: .error,
+                    subsystem: "state",
+                    operation: "state.loadConfig",
+                    message: "Failed loading config. Falling back to defaults.",
+                    errorCategory: .stateStoreFailure,
+                    errorMessage: error.localizedDescription
+                )
+            )
+            return fallback
+        }
+    }
+
+    public func saveConfig(_ config: AppConfig) async throws {
+        do {
+            try store.saveConfig(config)
+            await diagnostics.updateConfig(config)
+            await diagnostics.log(
+                SyncEvent(
+                    level: .info,
+                    subsystem: "state",
+                    operation: "state.saveConfig",
+                    message: "Saved app configuration.",
+                    metadata: [
+                        "logLevel": config.logLevel.rawValue,
+                        "debugLogging": "\(config.debugLogging)",
+                    ]
+                )
+            )
+        } catch {
+            await diagnostics.log(
+                SyncEvent(
+                    level: .error,
+                    subsystem: "state",
+                    operation: "state.saveConfig",
+                    message: "Failed saving app configuration.",
+                    errorCategory: .stateStoreFailure,
+                    errorMessage: error.localizedDescription
+                )
+            )
+            throw error
+        }
+    }
+
+    public func loadState() async -> SyncState {
+        do {
+            return try store.loadState()
+        } catch {
+            await diagnostics.log(
+                SyncEvent(
+                    level: .error,
+                    subsystem: "state",
+                    operation: "state.loadState",
+                    message: "Failed loading sync state. Returning empty state.",
+                    errorCategory: .stateStoreFailure,
+                    errorMessage: error.localizedDescription
+                )
+            )
+            return SyncState()
+        }
+    }
+
+    public func loadLastRunSnapshot() async -> LastRunSnapshot? {
+        await diagnostics.loadLastRunSnapshot()
+    }
+
+    public func loadCrashContext() async -> RunContext? {
+        await diagnostics.loadCrashContext()
+    }
+
+    public func latestLogFileURL() async -> URL? {
+        await diagnostics.latestLogFileURL()
+    }
+
+    public func diagnosticsDirectoryURL() async -> URL {
+        await diagnostics.diagnosticsDirectoryURL()
+    }
+
+    public func buildDiagnosticsSummary(currentStatus: String) async -> DiagnosticsSummary {
+        let config = await loadConfig()
+        let state = await loadState()
+        return await diagnostics.buildDiagnosticsSummary(
+            config: config,
+            state: state,
+            currentStatus: currentStatus,
+            appVersion: RuntimeEnvironment.appVersion()
+        )
+    }
+
+    public func logAppEvent(
+        level: LogLevel,
+        operation: String,
+        message: String,
+        category: FailureCategory? = nil,
+        metadata: [String: String]? = nil
+    ) async {
+        await diagnostics.log(
+            SyncEvent(
+                level: level,
+                subsystem: "app",
+                operation: operation,
+                message: message,
+                errorCategory: category,
+                errorMessage: category == nil ? nil : message,
+                metadata: metadata
+            )
+        )
+    }
+
+    public func recentEvents(limit: Int) async -> [SyncEvent] {
+        await diagnostics.loadRecentEvents(limit: limit)
+    }
+
+    public func runSync(
+        config: AppConfig,
+        trigger: SyncTrigger,
+        progress: @Sendable (SyncProgressUpdate) async -> Void = { _ in }
+    ) async -> SyncRunReport {
+        await diagnostics.updateConfig(config)
+
+        let startedAt = Date()
+        let runContext = RunContext(
+            runID: UUID().uuidString,
+            trigger: trigger,
+            startedAt: startedAt,
+            appVersion: RuntimeEnvironment.appVersion(),
+            osVersion: ProcessInfo.processInfo.operatingSystemVersionString
+        )
+
+        await diagnostics.setCrashContext(runContext)
+        await diagnostics.log(
+            SyncEvent(
+                level: .info,
+                subsystem: "sync",
+                operation: "sync.run.start",
+                runID: runContext.runID,
+                trigger: runContext.trigger,
+                message: "\(trigger.displayName) sync started.",
+                metadata: [
+                    "profile": config.providerProfile.rawValue,
+                    "prefix": config.materializedPrefix,
+                ]
+            )
+        )
+        await progress(
+            SyncProgressUpdate(
+                runID: runContext.runID,
+                stage: .starting,
+                message: "\(trigger.displayName) sync starting…",
+                processedPlaylistCount: 0
+            )
+        )
+
+        var processedPlaylistCount = 0
+        var addedTrackCount = 0
+        var removedTrackCount = 0
+        var createdPlaylistCount = 0
+        var deletedPlaylistCount = 0
+        var renamedPlaylistCount = 0
+        var failures: [SyncFailure] = []
+        var lastCompletedStep: String?
+        var state = SyncState()
+
+        do {
+            state = try store.loadState()
+        } catch {
+            let failure = makeFailure(
+                playlistName: "State",
+                operation: "state.loadState",
+                error: error
+            )
+            failures.append(failure)
+            let report = SyncRunReport(
+                runID: runContext.runID,
+                trigger: trigger,
+                startedAt: startedAt,
+                finishedAt: Date(),
+                processedPlaylistCount: 0,
+                addedTrackCount: 0,
+                removedTrackCount: 0,
+                createdPlaylistCount: 0,
+                deletedPlaylistCount: 0,
+                renamedPlaylistCount: 0,
+                failures: failures
+            )
+            await diagnostics.log(
+                SyncEvent(
+                    level: .error,
+                    subsystem: "state",
+                    operation: "state.loadState",
+                    runID: runContext.runID,
+                    trigger: trigger,
+                    message: failure.message,
+                    errorCategory: failure.category,
+                    errorMessage: failure.underlyingMessage
+                )
+            )
+            await finalizeRun(report: report, config: config, progress: progress, lastCompletedStep: lastCompletedStep)
+            return report
+        }
+
+        await progress(
+            SyncProgressUpdate(
+                runID: runContext.runID,
+                stage: .discoveringPlaylists,
+                message: "Discovering smart playlists…",
+                lastCompletedStep: lastCompletedStep,
+                processedPlaylistCount: processedPlaylistCount
+            )
+        )
+
+        let discoveredSmartPlaylists: [PlaylistSnapshot]
+        do {
+            discoveredSmartPlaylists = try await musicClient.listSmartPlaylistMetadata(runContext: runContext)
+        } catch {
+            let failure = makeFailure(
+                playlistName: "Library",
+                operation: "music.listSmartPlaylistMetadata",
+                error: error
+            )
+            failures.append(failure)
+            let report = SyncRunReport(
+                runID: runContext.runID,
+                trigger: trigger,
+                startedAt: startedAt,
+                finishedAt: Date(),
+                processedPlaylistCount: 0,
+                addedTrackCount: 0,
+                removedTrackCount: 0,
+                createdPlaylistCount: 0,
+                deletedPlaylistCount: 0,
+                renamedPlaylistCount: 0,
+                failures: failures
+            )
+            await diagnostics.log(
+                SyncEvent(
+                    level: .error,
+                    subsystem: "sync",
+                    operation: "sync.discoverPlaylists",
+                    runID: runContext.runID,
+                    trigger: trigger,
+                    message: failure.message,
+                    errorCategory: failure.category,
+                    errorMessage: failure.underlyingMessage
+                )
+            )
+            await finalizeRun(report: report, config: config, progress: progress, lastCompletedStep: lastCompletedStep)
+            return report
+        }
+
+        let playlistEvaluation = SyncPlanner.evaluateSmartPlaylists(
+            from: discoveredSmartPlaylists,
+            includeSystemPlaylists: config.includeSystemSmartPlaylists,
+            exclusionRules: config.sourcePlaylistExclusions
+        )
+
+        let sourcePlaylistMetadata = playlistEvaluation.included.sorted {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+
+        if playlistEvaluation.excludedByRules.isEmpty == false {
+            let excludedNames = playlistEvaluation.excludedByRules
+                .prefix(10)
+                .map(\.name)
+                .joined(separator: ", ")
+            await diagnostics.log(
+                SyncEvent(
+                    level: .info,
+                    subsystem: "sync",
+                    operation: "sync.excludePlaylists",
+                    runID: runContext.runID,
+                    trigger: trigger,
+                    message: "Skipping \(playlistEvaluation.excludedByRules.count) smart playlist(s) due to exclusion rules.",
+                    metadata: [
+                        "playlistCount": "\(playlistEvaluation.excludedByRules.count)",
+                        "playlistNames": excludedNames,
+                    ]
+                )
+            )
+        }
+
+        var sourcePlaylists: [PlaylistSnapshot] = []
+        sourcePlaylists.reserveCapacity(sourcePlaylistMetadata.count)
+
+        for sourceMetadata in sourcePlaylistMetadata {
+            await progress(
+                SyncProgressUpdate(
+                    runID: runContext.runID,
+                    stage: .discoveringPlaylists,
+                    message: "Loading \(sourceMetadata.name)…",
+                    lastCompletedStep: lastCompletedStep,
+                    currentPlaylistName: sourceMetadata.name,
+                    processedPlaylistCount: processedPlaylistCount
+                )
+            )
+
+            do {
+                let snapshot = try await musicClient.snapshotUserPlaylist(
+                    persistentID: sourceMetadata.persistentID,
+                    runContext: runContext,
+                    sourcePlaylistName: sourceMetadata.name
+                )
+                sourcePlaylists.append(snapshot)
+            } catch {
+                let failure = makeFailure(
+                    playlistName: sourceMetadata.name,
+                    operation: "music.snapshotUserPlaylist",
+                    error: error,
+                    sourcePlaylistPersistentID: sourceMetadata.persistentID
+                )
+                failures.append(failure)
+                await diagnostics.log(
+                    SyncEvent(
+                        level: .error,
+                        subsystem: "sync",
+                        operation: "sync.snapshotSourcePlaylist",
+                        runID: runContext.runID,
+                        trigger: trigger,
+                        message: failure.message,
+                        sourcePlaylistName: sourceMetadata.name,
+                        sourcePlaylistPersistentID: sourceMetadata.persistentID,
+                        errorCategory: failure.category,
+                        errorMessage: failure.underlyingMessage
+                    )
+                )
+            }
+        }
+
+        await diagnostics.log(
+            SyncEvent(
+                level: .info,
+                subsystem: "sync",
+                operation: "sync.discoverPlaylists",
+                runID: runContext.runID,
+                trigger: trigger,
+                message: "Ready to reconcile \(sourcePlaylists.count) smart playlists.",
+                metadata: [
+                    "playlistCount": "\(sourcePlaylists.count)",
+                    "excludedByRuleCount": "\(playlistEvaluation.excludedByRules.count)",
+                    "excludedBySystemCount": "\(playlistEvaluation.excludedBySystemFilter.count)",
+                ]
+            )
+        )
+
+        for source in sourcePlaylists {
+            var managed = state.managedPlaylists[source.persistentID] ?? ManagedPlaylistState(
+                sourcePersistentID: source.persistentID,
+                sourceName: source.name
+            )
+            managed.sourceName = source.name
+            managed.lastRunID = runContext.runID
+
+            await progress(
+                SyncProgressUpdate(
+                    runID: runContext.runID,
+                    stage: .reconcilingPlaylist,
+                    message: "Reconciling \(source.name)…",
+                    lastCompletedStep: lastCompletedStep,
+                    currentPlaylistName: source.name,
+                    processedPlaylistCount: processedPlaylistCount
+                )
+            )
+
+            await diagnostics.log(
+                SyncEvent(
+                    level: .info,
+                    subsystem: "sync",
+                    operation: "sync.reconcilePlaylist",
+                    runID: runContext.runID,
+                    trigger: trigger,
+                    message: "Reconciling smart playlist.",
+                    sourcePlaylistName: source.name,
+                    sourcePlaylistPersistentID: source.persistentID,
+                    trackCount: source.trackPersistentIDs.count
+                )
+            )
+
+            do {
+                let desiredChunks = SyncPlanner.chunkedTrackIDs(
+                    source.trackPersistentIDs,
+                    limit: config.providerProfile.trackLimit
+                )
+                let desiredNames = SyncPlanner.materializedPlaylistNames(
+                    prefix: config.materializedPrefix,
+                    sourceName: source.name,
+                    partCount: desiredChunks.count
+                )
+
+                var updatedParts: [ManagedPlaylistPart] = []
+                var nextSourceTrackStartIndex = 1
+
+                for (index, trackChunk) in desiredChunks.enumerated() {
+                    let desiredName = desiredNames[index]
+                    let sourceTrackStartIndex = nextSourceTrackStartIndex
+                    let sourceTrackEndIndex = sourceTrackStartIndex + trackChunk.count - 1
+                    let existingPart = managed.parts.first { $0.index == index }
+                    var targetPersistentID: String
+                    var targetTrackIDs: [String]?
+                    var rebuildMode: String?
+
+                    if let existingPart {
+                        do {
+                            let existingSnapshot = try await musicClient.snapshotUserPlaylist(
+                                persistentID: existingPart.targetPersistentID,
+                                runContext: runContext,
+                                sourcePlaylistName: source.name,
+                                targetPlaylistName: existingPart.targetName
+                            )
+                            if existingSnapshot.name != desiredName {
+                                try await musicClient.renamePlaylist(
+                                    persistentID: existingPart.targetPersistentID,
+                                    newName: desiredName,
+                                    runContext: runContext,
+                                    sourcePlaylistName: source.name
+                                )
+                                renamedPlaylistCount += 1
+                            }
+                            targetPersistentID = existingPart.targetPersistentID
+                            targetTrackIDs = existingSnapshot.trackPersistentIDs
+                        } catch {
+                            let ensuredTarget = try await musicClient.ensureUserPlaylist(
+                                named: desiredName,
+                                runContext: runContext,
+                                sourcePlaylistName: source.name
+                            )
+                            if ensuredTarget.wasCreated {
+                                createdPlaylistCount += 1
+                                targetTrackIDs = []
+                            } else {
+                                targetTrackIDs = nil
+                            }
+                            targetPersistentID = ensuredTarget.persistentID
+                            rebuildMode = "snapshotFallback"
+
+                            await diagnostics.log(
+                                SyncEvent(
+                                    level: .warning,
+                                    subsystem: "sync",
+                                    operation: "sync.targetSnapshotFallback",
+                                    runID: runContext.runID,
+                                    trigger: trigger,
+                                    message: "Target snapshot failed; forcing materialized playlist rebuild.",
+                                    sourcePlaylistName: source.name,
+                                    sourcePlaylistPersistentID: source.persistentID,
+                                    targetPlaylistName: desiredName,
+                                    targetPlaylistPersistentID: targetPersistentID,
+                                    partIndex: index,
+                                    totalParts: desiredChunks.count,
+                                    trackCount: trackChunk.count,
+                                    errorCategory: recoveryCategory(for: error),
+                                    errorMessage: recoveryMessage(for: error),
+                                    metadata: [
+                                        "recovery": "forceRebuild",
+                                        "targetWasCreated": ensuredTarget.wasCreated ? "true" : "false",
+                                    ]
+                                )
+                            )
+                        }
+                    } else {
+                        let ensuredTarget = try await musicClient.ensureUserPlaylist(
+                            named: desiredName,
+                            runContext: runContext,
+                            sourcePlaylistName: source.name
+                        )
+                        if ensuredTarget.wasCreated {
+                            createdPlaylistCount += 1
+                            targetTrackIDs = []
+                        } else {
+                            targetTrackIDs = nil
+                        }
+                        targetPersistentID = ensuredTarget.persistentID
+                        rebuildMode = "missingPart"
+                    }
+
+                    let diff = targetTrackIDs.map {
+                        SyncPlanner.diff(source: trackChunk, target: $0)
+                    }
+                    let shouldReplaceContents = rebuildMode != nil || targetTrackIDs != trackChunk
+                    if shouldReplaceContents {
+                        try await musicClient.replacePlaylistContents(
+                            sourcePlaylistPersistentID: source.persistentID,
+                            targetPlaylistPersistentID: targetPersistentID,
+                            sourceTrackStartIndex: sourceTrackStartIndex,
+                            sourceTrackEndIndex: sourceTrackEndIndex,
+                            desiredTrackIDs: trackChunk,
+                            runContext: runContext,
+                            sourcePlaylistName: source.name,
+                            targetPlaylistName: desiredName,
+                            partIndex: index,
+                            totalParts: desiredChunks.count
+                        )
+                    }
+
+                    if let diff {
+                        addedTrackCount += diff.toAdd.count
+                        removedTrackCount += diff.toRemove.count
+                    }
+
+                    var reconcileMetadata: [String: String] = [:]
+                    if let rebuildMode {
+                        reconcileMetadata["rebuildMode"] = rebuildMode
+                    }
+                    if diff == nil {
+                        reconcileMetadata["diffAvailable"] = "false"
+                    }
+
+                    await diagnostics.log(
+                        SyncEvent(
+                            level: .info,
+                            subsystem: "sync",
+                            operation: "sync.reconcilePart",
+                            runID: runContext.runID,
+                            trigger: trigger,
+                            message: rebuildMode == nil
+                                ? "Reconciled materialized playlist part."
+                                : "Rebuilt materialized playlist part.",
+                            sourcePlaylistName: source.name,
+                            sourcePlaylistPersistentID: source.persistentID,
+                            targetPlaylistName: desiredName,
+                            targetPlaylistPersistentID: targetPersistentID,
+                            partIndex: index,
+                            totalParts: desiredChunks.count,
+                            trackCount: trackChunk.count,
+                            addedTrackCount: diff?.toAdd.count,
+                            removedTrackCount: diff?.toRemove.count,
+                            metadata: reconcileMetadata.isEmpty ? nil : reconcileMetadata
+                        )
+                    )
+
+                    updatedParts.append(
+                        ManagedPlaylistPart(
+                            index: index,
+                            targetPersistentID: targetPersistentID,
+                            targetName: desiredName
+                        )
+                    )
+
+                    nextSourceTrackStartIndex = sourceTrackEndIndex + 1
+                }
+
+                let staleParts = managed.parts.filter { oldPart in
+                    updatedParts.contains(where: { $0.index == oldPart.index }) == false
+                }
+
+                if config.deleteStaleManagedPlaylists && !staleParts.isEmpty {
+                    await progress(
+                        SyncProgressUpdate(
+                            runID: runContext.runID,
+                            stage: .deletingStalePlaylists,
+                            message: "Deleting stale materialized playlists for \(source.name)…",
+                            lastCompletedStep: lastCompletedStep,
+                            currentPlaylistName: source.name,
+                            processedPlaylistCount: processedPlaylistCount
+                        )
+                    )
+                }
+
+                if config.deleteStaleManagedPlaylists {
+                    for stalePart in staleParts {
+                        do {
+                            try await musicClient.deletePlaylist(
+                                persistentID: stalePart.targetPersistentID,
+                                runContext: runContext,
+                                sourcePlaylistName: source.name,
+                                targetPlaylistName: stalePart.targetName
+                            )
+                            deletedPlaylistCount += 1
+                        } catch {
+                            let failure = makeFailure(
+                                playlistName: stalePart.targetName,
+                                operation: "music.deletePlaylist",
+                                error: error,
+                                sourcePlaylistPersistentID: source.persistentID,
+                                targetPlaylistPersistentID: stalePart.targetPersistentID,
+                                targetPlaylistName: stalePart.targetName
+                            )
+                            failures.append(failure)
+                            await diagnostics.log(
+                                SyncEvent(
+                                    level: .error,
+                                    subsystem: "sync",
+                                    operation: "sync.deleteStalePart",
+                                    runID: runContext.runID,
+                                    trigger: trigger,
+                                    message: failure.message,
+                                    sourcePlaylistName: source.name,
+                                    sourcePlaylistPersistentID: source.persistentID,
+                                    targetPlaylistName: stalePart.targetName,
+                                    targetPlaylistPersistentID: stalePart.targetPersistentID,
+                                    errorCategory: failure.category,
+                                    errorMessage: failure.underlyingMessage
+                                )
+                            )
+                        }
+                    }
+                }
+
+                managed.parts = updatedParts.sorted { $0.index < $1.index }
+                managed.lastSyncedAt = Date()
+                managed.lastError = nil
+                managed.lastFailureCategory = nil
+                managed.lastRunID = runContext.runID
+                state.managedPlaylists[source.persistentID] = managed
+
+                lastCompletedStep = "Reconciled \(source.name)"
+                await diagnostics.log(
+                    SyncEvent(
+                        level: .info,
+                        subsystem: "sync",
+                        operation: "sync.reconcilePlaylist",
+                        runID: runContext.runID,
+                        trigger: trigger,
+                        message: "Finished reconciling smart playlist.",
+                        sourcePlaylistName: source.name,
+                        sourcePlaylistPersistentID: source.persistentID,
+                        trackCount: source.trackPersistentIDs.count,
+                        metadata: ["parts": "\(updatedParts.count)"]
+                    )
+                )
+            } catch {
+                let failure = makeFailure(
+                    playlistName: source.name,
+                    operation: "sync.reconcilePlaylist",
+                    error: error,
+                    sourcePlaylistPersistentID: source.persistentID
+                )
+                managed.lastError = failure.message
+                managed.lastFailureCategory = failure.category
+                managed.lastRunID = runContext.runID
+                state.managedPlaylists[source.persistentID] = managed
+                failures.append(failure)
+                lastCompletedStep = "Failed \(source.name)"
+
+                await diagnostics.log(
+                    SyncEvent(
+                        level: .error,
+                        subsystem: "sync",
+                        operation: "sync.reconcilePlaylist",
+                        runID: runContext.runID,
+                        trigger: trigger,
+                        message: failure.message,
+                        sourcePlaylistName: source.name,
+                        sourcePlaylistPersistentID: source.persistentID,
+                        errorCategory: failure.category,
+                        errorMessage: failure.underlyingMessage
+                    )
+                )
+            }
+
+            processedPlaylistCount += 1
+        }
+
+        let liveSourceIDs = playlistEvaluation.protectedSourceIDs
+        let staleSourceIDs = state.managedPlaylists.keys.filter { !liveSourceIDs.contains($0) }
+        if config.deleteStaleManagedPlaylists && !staleSourceIDs.isEmpty {
+            await progress(
+                SyncProgressUpdate(
+                    runID: runContext.runID,
+                    stage: .deletingStalePlaylists,
+                    message: "Deleting orphaned materialized playlists…",
+                    lastCompletedStep: lastCompletedStep,
+                    processedPlaylistCount: processedPlaylistCount
+                )
+            )
+        }
+
+        for staleSourceID in staleSourceIDs {
+            guard let staleManaged = state.managedPlaylists[staleSourceID] else {
+                continue
+            }
+
+            var encounteredDeletionFailure = false
+            if config.deleteStaleManagedPlaylists {
+                for part in staleManaged.parts {
+                    do {
+                        try await musicClient.deletePlaylist(
+                            persistentID: part.targetPersistentID,
+                            runContext: runContext,
+                            sourcePlaylistName: staleManaged.sourceName,
+                            targetPlaylistName: part.targetName
+                        )
+                        deletedPlaylistCount += 1
+                    } catch {
+                        encounteredDeletionFailure = true
+                        let failure = makeFailure(
+                            playlistName: staleManaged.sourceName,
+                            operation: "music.deletePlaylist",
+                            error: error,
+                            sourcePlaylistPersistentID: staleManaged.sourcePersistentID,
+                            targetPlaylistPersistentID: part.targetPersistentID,
+                            targetPlaylistName: part.targetName
+                        )
+                        failures.append(failure)
+                        await diagnostics.log(
+                            SyncEvent(
+                                level: .error,
+                                subsystem: "sync",
+                                operation: "sync.deleteOrphanedPlaylist",
+                                runID: runContext.runID,
+                                trigger: trigger,
+                                message: failure.message,
+                                sourcePlaylistName: staleManaged.sourceName,
+                                sourcePlaylistPersistentID: staleManaged.sourcePersistentID,
+                                targetPlaylistName: part.targetName,
+                                targetPlaylistPersistentID: part.targetPersistentID,
+                                errorCategory: failure.category,
+                                errorMessage: failure.underlyingMessage
+                            )
+                        )
+                    }
+                }
+            }
+
+            if config.deleteStaleManagedPlaylists {
+                if encounteredDeletionFailure {
+                    var updatedManaged = staleManaged
+                    updatedManaged.lastError = "Failed deleting one or more orphaned materialized playlists."
+                    updatedManaged.lastFailureCategory = .unknown
+                    updatedManaged.lastRunID = runContext.runID
+                    state.managedPlaylists[staleSourceID] = updatedManaged
+                } else {
+                    state.managedPlaylists.removeValue(forKey: staleSourceID)
+                }
+            } else {
+                state.managedPlaylists.removeValue(forKey: staleSourceID)
+            }
+        }
+
+        await progress(
+            SyncProgressUpdate(
+                runID: runContext.runID,
+                stage: .savingState,
+                message: "Saving sync state…",
+                lastCompletedStep: lastCompletedStep,
+                processedPlaylistCount: processedPlaylistCount
+            )
+        )
+
+        do {
+            try store.saveState(state)
+        } catch {
+            let failure = makeFailure(
+                playlistName: "State",
+                operation: "state.saveState",
+                error: error
+            )
+            failures.append(failure)
+            await diagnostics.log(
+                SyncEvent(
+                    level: .error,
+                    subsystem: "state",
+                    operation: "state.saveState",
+                    runID: runContext.runID,
+                    trigger: trigger,
+                    message: failure.message,
+                    errorCategory: failure.category,
+                    errorMessage: failure.underlyingMessage
+                )
+            )
+        }
+
+        let report = SyncRunReport(
+            runID: runContext.runID,
+            trigger: trigger,
+            startedAt: startedAt,
+            finishedAt: Date(),
+            processedPlaylistCount: processedPlaylistCount,
+            addedTrackCount: addedTrackCount,
+            removedTrackCount: removedTrackCount,
+            createdPlaylistCount: createdPlaylistCount,
+            deletedPlaylistCount: deletedPlaylistCount,
+            renamedPlaylistCount: renamedPlaylistCount,
+            failures: failures
+        )
+
+        await finalizeRun(report: report, config: config, progress: progress, lastCompletedStep: lastCompletedStep)
+        return report
+    }
+
+    private func finalizeRun(
+        report: SyncRunReport,
+        config: AppConfig,
+        progress: @Sendable (SyncProgressUpdate) async -> Void,
+        lastCompletedStep: String?
+    ) async {
+        await diagnostics.saveLastRunSnapshot(LastRunSnapshot(report: report, config: config))
+        await diagnostics.clearCrashContext()
+        await diagnostics.log(
+            SyncEvent(
+                level: report.failures.isEmpty ? .info : .warning,
+                subsystem: "sync",
+                operation: "sync.run.finish",
+                runID: report.runID,
+                trigger: report.trigger,
+                message: report.failures.isEmpty ? "Sync run completed successfully." : "Sync run completed with \(report.failures.count) issue(s).",
+                addedTrackCount: report.addedTrackCount,
+                removedTrackCount: report.removedTrackCount,
+                durationMilliseconds: report.durationMilliseconds,
+                metadata: [
+                    "processedPlaylistCount": "\(report.processedPlaylistCount)",
+                    "failureCount": "\(report.failures.count)",
+                ]
+            )
+        )
+        await progress(
+            SyncProgressUpdate(
+                runID: report.runID,
+                stage: report.failures.isEmpty ? .completed : .failed,
+                message: report.failures.isEmpty ? "Sync completed." : "Sync completed with \(report.failures.count) issue(s).",
+                lastCompletedStep: lastCompletedStep,
+                processedPlaylistCount: report.processedPlaylistCount
+            )
+        )
+    }
+
+    private func makeFailure(
+        playlistName: String,
+        operation: String,
+        error: Error,
+        sourcePlaylistPersistentID: String? = nil,
+        targetPlaylistPersistentID: String? = nil,
+        targetPlaylistName: String? = nil
+    ) -> SyncFailure {
+        if let osaScriptError = error as? OsaScriptError {
+            return SyncFailure(
+                playlistName: playlistName,
+                message: osaScriptError.message,
+                category: osaScriptError.category,
+                operation: operation,
+                sourcePlaylistPersistentID: sourcePlaylistPersistentID,
+                targetPlaylistPersistentID: targetPlaylistPersistentID,
+                targetPlaylistName: targetPlaylistName,
+                underlyingMessage: osaScriptError.message
+            )
+        }
+
+        return SyncFailure(
+            playlistName: playlistName,
+            message: error.localizedDescription,
+            category: FailureCategory.classify(message: error.localizedDescription, operation: operation),
+            operation: operation,
+            sourcePlaylistPersistentID: sourcePlaylistPersistentID,
+            targetPlaylistPersistentID: targetPlaylistPersistentID,
+            targetPlaylistName: targetPlaylistName,
+            underlyingMessage: error.localizedDescription
+        )
+    }
+
+    private func recoveryCategory(for error: Error) -> FailureCategory {
+        switch error {
+        case let error as OsaScriptError:
+            return error.category
+        case _ as OsaScriptTimeoutError:
+            return .appleScriptExecutionFailed
+        default:
+            return FailureCategory.classify(message: error.localizedDescription)
+        }
+    }
+
+    private func recoveryMessage(for error: Error) -> String {
+        switch error {
+        case let error as OsaScriptError:
+            return error.message
+        case let error as OsaScriptTimeoutError:
+            return error.message
+        default:
+            return error.localizedDescription
+        }
+    }
+}
