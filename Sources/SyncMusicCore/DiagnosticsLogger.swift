@@ -168,7 +168,7 @@ public actor DiagnosticsLogger {
         lines.append("Active log: \(SyncMusicPaths.activeLogFile(rootDirectory: rootDirectory).path)")
         lines.append("")
         lines.append("Config")
-        lines.append("- Interval: \(config.syncIntervalMinutes) min")
+        lines.append("- Schedule: \(config.autoSyncSchedule.displayDescription)")
         lines.append("- Prefix: \(config.materializedPrefix)")
         lines.append("- Include system playlists: \(config.includeSystemSmartPlaylists)")
         lines.append("- Source exclusions: \(config.sourcePlaylistExclusions.filter(\.isEnabled).count)")

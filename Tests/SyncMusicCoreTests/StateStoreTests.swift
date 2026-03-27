@@ -10,7 +10,7 @@ struct StateStoreTests {
         let store = StateStore(rootDirectory: tempDirectory)
 
         let config = AppConfig(
-            syncIntervalMinutes: 45,
+            autoSyncSchedule: .daily(time: DailySyncTime(hour: 2, minute: 15)),
             materializedPrefix: "Managed",
             includeSystemSmartPlaylists: true,
             providerProfile: .generic,
@@ -26,7 +26,7 @@ struct StateStoreTests {
                 lastSyncedAt: Date(timeIntervalSince1970: 1_234),
                 lastError: nil
             ),
-        ])
+        ], lastScheduledAttemptAt: Date(timeIntervalSince1970: 4_321))
 
         try store.saveConfig(config)
         try store.saveState(state)
@@ -61,5 +61,28 @@ struct StateStoreTests {
         #expect(report.rebuiltPlaylistPartCount == 0)
         #expect(report.addedTrackCount == 12)
         #expect(report.removedTrackCount == 3)
+    }
+
+    @Test
+    func appConfigDecodesLegacyIntervalSchedule() throws {
+        let json = """
+        {
+          "syncIntervalMinutes": 45,
+          "materializedPrefix": "Managed",
+          "includeSystemSmartPlaylists": false,
+          "sourcePlaylistExclusions": [],
+          "providerProfile": "generic",
+          "deleteStaleManagedPlaylists": false,
+          "logLevel": "info",
+          "debugLogging": false,
+          "maxLogFileSizeBytes": 2000000,
+          "maxRotatedLogFiles": 5
+        }
+        """
+
+        let decoder = JSONDecoder()
+        let config = try decoder.decode(AppConfig.self, from: Data(json.utf8))
+
+        #expect(config.autoSyncSchedule == .interval(minutes: 45))
     }
 }

@@ -25,8 +25,12 @@ final class AppModel: ObservableObject {
     @Published var activeCurrentPlaylistName: String?
 
     private let engine: SyncEngine
+    private var currentState = SyncState()
     private var schedulerTask: Task<Void, Never>?
     private var hasStarted = false
+    private var wakeObserver: NSObjectProtocol?
+    private var clockChangeObserver: NSObjectProtocol?
+    private var dayChangeObserver: NSObjectProtocol?
 
     init() {
         let diagnostics = DiagnosticsLogger()
@@ -66,6 +70,7 @@ final class AppModel: ObservableObject {
             }
 
             refreshLaunchAtLoginState()
+            installSchedulerObserversIfNeeded()
             restartScheduler(runStartupSync: true)
         }
     }
@@ -104,7 +109,7 @@ final class AppModel: ObservableObject {
                 config = normalized
                 hasPendingConfigChanges = false
 
-                if normalized.syncIntervalMinutes != previousConfig.syncIntervalMinutes {
+                if normalized.autoSyncSchedule != previousConfig.autoSyncSchedule {
                     restartScheduler(runStartupSync: false)
                 }
 
@@ -261,18 +266,66 @@ final class AppModel: ObservableObject {
             }
 
             while !Task.isCancelled {
-                let seconds = max(1, config.syncIntervalMinutes) * 60
-                try? await Task.sleep(for: .seconds(seconds))
-                guard !Task.isCancelled else {
-                    break
+                switch config.autoSyncSchedule.normalized {
+                case .interval(let minutes):
+                    try? await Task.sleep(for: .seconds(TimeInterval(minutes * 60)))
+                    guard !Task.isCancelled else {
+                        break
+                    }
+                    await runSync(trigger: .scheduled, reason: "Scheduled sync")
+                case .daily:
+                    let evaluation = config.autoSyncSchedule.evaluate(
+                        now: Date(),
+                        lastScheduledAttemptAt: currentState.lastScheduledAttemptAt
+                    )
+
+                    if evaluation.shouldRunNow {
+                        let started = await runSync(
+                            trigger: .scheduled,
+                            reason: "Daily scheduled sync",
+                            scheduledAttemptAt: Date()
+                        )
+
+                        if started == false, !Task.isCancelled {
+                            try? await Task.sleep(for: .seconds(60))
+                        }
+                        continue
+                    }
+
+                    let secondsUntilCheck = max(1, evaluation.nextCheckAt.timeIntervalSinceNow)
+                    try? await Task.sleep(for: .seconds(secondsUntilCheck))
                 }
-                await runSync(trigger: .scheduled, reason: "Scheduled sync")
             }
         }
     }
 
-    private func runSync(trigger: SyncTrigger, reason: String) async {
-        guard !isSyncing else { return }
+    @discardableResult
+    private func runSync(
+        trigger: SyncTrigger,
+        reason: String,
+        scheduledAttemptAt: Date? = nil
+    ) async -> Bool {
+        guard !isSyncing else { return false }
+
+        if let scheduledAttemptAt {
+            let previousAttemptAt = currentState.lastScheduledAttemptAt
+            currentState.lastScheduledAttemptAt = scheduledAttemptAt
+
+            do {
+                try await engine.saveState(currentState)
+            } catch {
+                currentState.lastScheduledAttemptAt = previousAttemptAt
+                statusText = "Failed scheduling daily sync: \(error.localizedDescription)"
+                await engine.logAppEvent(
+                    level: .error,
+                    operation: "scheduler.recordScheduledAttempt",
+                    message: error.localizedDescription,
+                    category: .stateStoreFailure
+                )
+                return false
+            }
+        }
+
         beginActiveRun(trigger: trigger)
         isSyncing = true
         statusText = "\(reason) in progress…"
@@ -309,6 +362,8 @@ final class AppModel: ObservableObject {
             statusText = "Last sync finished with \(report.failures.count) issue(s)."
             lastCompletedStepText = "Completed \(trigger.displayName.lowercased()) sync with issues in \(report.durationMilliseconds) ms."
         }
+
+        return true
     }
 
     private func refreshLaunchAtLoginState() {
@@ -321,6 +376,7 @@ final class AppModel: ObservableObject {
     }
 
     private func applyState(_ state: SyncState) {
+        currentState = state
         managedPlaylists = state.managedPlaylists.values.sorted {
             $0.sourceName.localizedCaseInsensitiveCompare($1.sourceName) == .orderedAscending
         }
@@ -346,10 +402,61 @@ final class AppModel: ObservableObject {
 
     private func normalizedConfig(from candidate: AppConfig) -> AppConfig {
         var normalized = candidate
-        normalized.syncIntervalMinutes = max(1, normalized.syncIntervalMinutes)
+        normalized.autoSyncSchedule = normalized.autoSyncSchedule.normalized
         if normalized.materializedPrefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             normalized.materializedPrefix = "Sync Mirror"
         }
         return normalized
+    }
+
+    private func installSchedulerObserversIfNeeded() {
+        guard wakeObserver == nil, clockChangeObserver == nil, dayChangeObserver == nil else {
+            return
+        }
+
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleSchedulerEnvironmentChange(reason: "Wake")
+            }
+        }
+
+        clockChangeObserver = NotificationCenter.default.addObserver(
+            forName: .NSSystemClockDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleSchedulerEnvironmentChange(reason: "Clock change")
+            }
+        }
+
+        dayChangeObserver = NotificationCenter.default.addObserver(
+            forName: .NSCalendarDayChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleSchedulerEnvironmentChange(reason: "Calendar day changed")
+            }
+        }
+    }
+
+    private func handleSchedulerEnvironmentChange(reason: String) {
+        guard hasStarted else {
+            return
+        }
+
+        Task {
+            await engine.logAppEvent(
+                level: .debug,
+                operation: "scheduler.environmentChange",
+                message: "\(reason) detected. Re-evaluating auto-sync schedule."
+            )
+        }
+        restartScheduler(runStartupSync: false)
     }
 }

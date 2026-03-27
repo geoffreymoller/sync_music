@@ -87,6 +87,24 @@ public actor SyncEngine {
         }
     }
 
+    public func saveState(_ state: SyncState) async throws {
+        do {
+            try store.saveState(state)
+        } catch {
+            await diagnostics.log(
+                SyncEvent(
+                    level: .error,
+                    subsystem: "state",
+                    operation: "state.saveState",
+                    message: "Failed saving sync state.",
+                    errorCategory: .stateStoreFailure,
+                    errorMessage: error.localizedDescription
+                )
+            )
+            throw error
+        }
+    }
+
     public func loadLastRunSnapshot() async -> LastRunSnapshot? {
         await diagnostics.loadLastRunSnapshot()
     }

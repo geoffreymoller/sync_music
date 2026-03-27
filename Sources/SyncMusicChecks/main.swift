@@ -1163,7 +1163,7 @@ func runChecks() async throws {
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
     let store = StateStore(rootDirectory: tempDirectory)
     let config = AppConfig(
-        syncIntervalMinutes: 45,
+        autoSyncSchedule: .interval(minutes: 45),
         materializedPrefix: "Managed",
         includeSystemSmartPlaylists: true,
         sourcePlaylistExclusions: [

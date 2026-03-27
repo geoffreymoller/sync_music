@@ -79,9 +79,202 @@ public struct ManagedPlaylistState: Codable, Equatable, Identifiable, Sendable {
 
 public struct SyncState: Codable, Equatable, Sendable {
     public var managedPlaylists: [String: ManagedPlaylistState]
+    public var lastScheduledAttemptAt: Date?
 
-    public init(managedPlaylists: [String: ManagedPlaylistState] = [:]) {
+    public init(
+        managedPlaylists: [String: ManagedPlaylistState] = [:],
+        lastScheduledAttemptAt: Date? = nil
+    ) {
         self.managedPlaylists = managedPlaylists
+        self.lastScheduledAttemptAt = lastScheduledAttemptAt
+    }
+}
+
+public enum AutoSyncScheduleKind: String, Codable, CaseIterable, Identifiable, Sendable {
+    case interval
+    case daily
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .interval:
+            return "Interval"
+        case .daily:
+            return "Daily"
+        }
+    }
+}
+
+public struct DailySyncTime: Codable, Equatable, Sendable {
+    public var hour: Int
+    public var minute: Int
+
+    public init(hour: Int = 2, minute: Int = 0) {
+        self.hour = hour
+        self.minute = minute
+    }
+
+    public var normalized: DailySyncTime {
+        DailySyncTime(
+            hour: min(max(hour, 0), 23),
+            minute: min(max(minute, 0), 59)
+        )
+    }
+
+    public var displayDescription: String {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.timeStyle = .short
+        formatter.dateStyle = .none
+        return formatter.string(from: date(on: Date(), calendar: .current))
+    }
+
+    public func date(on referenceDate: Date, calendar: Calendar = .current) -> Date {
+        let dayStart = calendar.startOfDay(for: referenceDate)
+        let components = DateComponents(
+            hour: normalized.hour,
+            minute: normalized.minute,
+            second: 0
+        )
+
+        return calendar.nextDate(
+            after: dayStart.addingTimeInterval(-1),
+            matching: components,
+            matchingPolicy: .nextTime,
+            direction: .forward
+        ) ?? dayStart
+    }
+}
+
+public struct AutoSyncScheduleEvaluation: Equatable, Sendable {
+    public let shouldRunNow: Bool
+    public let nextCheckAt: Date
+
+    public init(shouldRunNow: Bool, nextCheckAt: Date) {
+        self.shouldRunNow = shouldRunNow
+        self.nextCheckAt = nextCheckAt
+    }
+}
+
+public enum AutoSyncSchedule: Equatable, Sendable {
+    case interval(minutes: Int)
+    case daily(time: DailySyncTime)
+
+    public var kind: AutoSyncScheduleKind {
+        switch self {
+        case .interval:
+            return .interval
+        case .daily:
+            return .daily
+        }
+    }
+
+    public var normalized: AutoSyncSchedule {
+        switch self {
+        case .interval(let minutes):
+            return .interval(minutes: max(1, minutes))
+        case .daily(let time):
+            return .daily(time: time.normalized)
+        }
+    }
+
+    public var intervalMinutes: Int? {
+        switch self {
+        case .interval(let minutes):
+            return minutes
+        case .daily:
+            return nil
+        }
+    }
+
+    public var dailyTime: DailySyncTime? {
+        switch self {
+        case .interval:
+            return nil
+        case .daily(let time):
+            return time
+        }
+    }
+
+    public var displayDescription: String {
+        switch normalized {
+        case .interval(let minutes):
+            return "Every \(minutes) min"
+        case .daily(let time):
+            return "Daily at \(time.displayDescription)"
+        }
+    }
+
+    public func evaluate(
+        now: Date,
+        lastScheduledAttemptAt: Date?,
+        calendar: Calendar = .current
+    ) -> AutoSyncScheduleEvaluation {
+        switch normalized {
+        case .interval(let minutes):
+            return AutoSyncScheduleEvaluation(
+                shouldRunNow: false,
+                nextCheckAt: now.addingTimeInterval(TimeInterval(minutes * 60))
+            )
+        case .daily(let time):
+            let scheduledToday = time.date(on: now, calendar: calendar)
+            let attemptedToday = lastScheduledAttemptAt.map { calendar.isDate($0, inSameDayAs: now) } ?? false
+
+            if attemptedToday == false, now >= scheduledToday {
+                return AutoSyncScheduleEvaluation(
+                    shouldRunNow: true,
+                    nextCheckAt: scheduledToday
+                )
+            }
+
+            if now < scheduledToday {
+                return AutoSyncScheduleEvaluation(
+                    shouldRunNow: false,
+                    nextCheckAt: scheduledToday
+                )
+            }
+
+            let tomorrow = calendar.date(byAdding: .day, value: 1, to: now) ?? now.addingTimeInterval(86_400)
+            return AutoSyncScheduleEvaluation(
+                shouldRunNow: false,
+                nextCheckAt: time.date(on: tomorrow, calendar: calendar)
+            )
+        }
+    }
+}
+
+extension AutoSyncSchedule: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case kind
+        case minutes
+        case dailyTime
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let kind = try container.decode(AutoSyncScheduleKind.self, forKey: .kind)
+
+        switch kind {
+        case .interval:
+            let minutes = try container.decodeIfPresent(Int.self, forKey: .minutes) ?? 30
+            self = .interval(minutes: minutes)
+        case .daily:
+            let time = try container.decodeIfPresent(DailySyncTime.self, forKey: .dailyTime) ?? DailySyncTime()
+            self = .daily(time: time)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(kind, forKey: .kind)
+
+        switch normalized {
+        case .interval(let minutes):
+            try container.encode(minutes, forKey: .minutes)
+        case .daily(let time):
+            try container.encode(time, forKey: .dailyTime)
+        }
     }
 }
 
@@ -278,7 +471,7 @@ public struct PlaylistExclusionRule: Codable, Equatable, Identifiable, Sendable 
 }
 
 public struct AppConfig: Codable, Equatable, Sendable {
-    public var syncIntervalMinutes: Int
+    public var autoSyncSchedule: AutoSyncSchedule
     public var materializedPrefix: String
     public var includeSystemSmartPlaylists: Bool
     public var sourcePlaylistExclusions: [PlaylistExclusionRule]
@@ -297,7 +490,7 @@ public struct AppConfig: Codable, Equatable, Sendable {
     }
 
     public init(
-        syncIntervalMinutes: Int = 30,
+        autoSyncSchedule: AutoSyncSchedule = .interval(minutes: 30),
         materializedPrefix: String = "Sync Mirror",
         includeSystemSmartPlaylists: Bool = false,
         sourcePlaylistExclusions: [PlaylistExclusionRule] = AppConfig.defaultSourcePlaylistExclusions,
@@ -308,7 +501,7 @@ public struct AppConfig: Codable, Equatable, Sendable {
         maxLogFileSizeBytes: Int = 2_000_000,
         maxRotatedLogFiles: Int = 5
     ) {
-        self.syncIntervalMinutes = syncIntervalMinutes
+        self.autoSyncSchedule = autoSyncSchedule.normalized
         self.materializedPrefix = materializedPrefix
         self.includeSystemSmartPlaylists = includeSystemSmartPlaylists
         self.sourcePlaylistExclusions = sourcePlaylistExclusions
@@ -320,7 +513,18 @@ public struct AppConfig: Codable, Equatable, Sendable {
         self.maxRotatedLogFiles = maxRotatedLogFiles
     }
 
+    public var syncIntervalMinutes: Int {
+        get { autoSyncSchedule.intervalMinutes ?? 30 }
+        set { autoSyncSchedule = .interval(minutes: newValue) }
+    }
+
+    public var dailySyncTime: DailySyncTime {
+        get { autoSyncSchedule.dailyTime ?? DailySyncTime() }
+        set { autoSyncSchedule = .daily(time: newValue) }
+    }
+
     private enum CodingKeys: String, CodingKey {
+        case autoSyncSchedule
         case syncIntervalMinutes
         case materializedPrefix
         case includeSystemSmartPlaylists
@@ -335,7 +539,12 @@ public struct AppConfig: Codable, Equatable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        syncIntervalMinutes = try container.decodeIfPresent(Int.self, forKey: .syncIntervalMinutes) ?? 30
+        if let autoSyncSchedule = try container.decodeIfPresent(AutoSyncSchedule.self, forKey: .autoSyncSchedule) {
+            self.autoSyncSchedule = autoSyncSchedule.normalized
+        } else {
+            let legacyInterval = try container.decodeIfPresent(Int.self, forKey: .syncIntervalMinutes) ?? 30
+            self.autoSyncSchedule = .interval(minutes: max(1, legacyInterval))
+        }
         materializedPrefix = try container.decodeIfPresent(String.self, forKey: .materializedPrefix) ?? "Sync Mirror"
         includeSystemSmartPlaylists = try container.decodeIfPresent(Bool.self, forKey: .includeSystemSmartPlaylists) ?? false
         sourcePlaylistExclusions = try container.decodeIfPresent([PlaylistExclusionRule].self, forKey: .sourcePlaylistExclusions)
@@ -350,7 +559,7 @@ public struct AppConfig: Codable, Equatable, Sendable {
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(syncIntervalMinutes, forKey: .syncIntervalMinutes)
+        try container.encode(autoSyncSchedule.normalized, forKey: .autoSyncSchedule)
         try container.encode(materializedPrefix, forKey: .materializedPrefix)
         try container.encode(includeSystemSmartPlaylists, forKey: .includeSystemSmartPlaylists)
         try container.encode(sourcePlaylistExclusions, forKey: .sourcePlaylistExclusions)

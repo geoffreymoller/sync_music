@@ -162,17 +162,28 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section("Sync") {
-                Stepper(
-                    value: Binding(
-                        get: { model.draftConfig.syncIntervalMinutes },
-                        set: { newValue in
-                            model.updateDraftConfig { $0.syncIntervalMinutes = max(1, newValue) }
-                        }
-                    ),
-                    in: 1...1_440
-                ) {
-                    Text("Interval: \(model.draftConfig.syncIntervalMinutes) min")
+                Picker("Auto Sync", selection: scheduleKindBinding) {
+                    ForEach(AutoSyncScheduleKind.allCases) { kind in
+                        Text(kind.displayName).tag(kind)
+                    }
                 }
+
+                switch model.draftConfig.autoSyncSchedule.normalized {
+                case .interval:
+                    Stepper(value: intervalMinutesBinding, in: 1...1_440) {
+                        Text("Interval: \(model.draftConfig.syncIntervalMinutes) min")
+                    }
+                case .daily:
+                    DatePicker(
+                        "Daily Time",
+                        selection: dailyTimeBinding,
+                        displayedComponents: .hourAndMinute
+                    )
+                }
+
+                Text("Schedule: \(model.draftConfig.autoSyncSchedule.displayDescription)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                 TextField(
                     "Materialized Prefix",
@@ -381,6 +392,50 @@ struct SettingsView: View {
         }
         .padding(20)
         .frame(width: 520)
+    }
+
+    private var scheduleKindBinding: Binding<AutoSyncScheduleKind> {
+        Binding(
+            get: { model.draftConfig.autoSyncSchedule.kind },
+            set: { newValue in
+                model.updateDraftConfig { config in
+                    switch newValue {
+                    case .interval:
+                        let minutes = config.autoSyncSchedule.intervalMinutes ?? config.syncIntervalMinutes
+                        config.autoSyncSchedule = .interval(minutes: max(1, minutes))
+                    case .daily:
+                        let time = config.autoSyncSchedule.dailyTime ?? config.dailySyncTime
+                        config.autoSyncSchedule = .daily(time: time.normalized)
+                    }
+                }
+            }
+        )
+    }
+
+    private var intervalMinutesBinding: Binding<Int> {
+        Binding(
+            get: { model.draftConfig.syncIntervalMinutes },
+            set: { newValue in
+                model.updateDraftConfig {
+                    $0.autoSyncSchedule = .interval(minutes: max(1, newValue))
+                }
+            }
+        )
+    }
+
+    private var dailyTimeBinding: Binding<Date> {
+        Binding(
+            get: { model.draftConfig.dailySyncTime.date(on: Date()) },
+            set: { newValue in
+                let components = Calendar.current.dateComponents([.hour, .minute], from: newValue)
+                let hour = components.hour ?? 2
+                let minute = components.minute ?? 0
+
+                model.updateDraftConfig {
+                    $0.autoSyncSchedule = .daily(time: DailySyncTime(hour: hour, minute: minute))
+                }
+            }
+        )
     }
 }
 

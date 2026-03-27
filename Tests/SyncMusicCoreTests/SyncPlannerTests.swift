@@ -1,3 +1,4 @@
+import Foundation
 import SyncMusicCore
 import Testing
 
@@ -60,5 +61,64 @@ struct SyncPlannerTests {
         )
 
         #expect(filtered == [userPlaylist])
+    }
+
+    @Test
+    func dailyScheduleRunsAfterDueTimeWhenNoAttemptWasRecorded() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .current
+        let schedule = AutoSyncSchedule.daily(time: DailySyncTime(hour: 2, minute: 0))
+        let now = try #require(calendar.date(from: DateComponents(
+            year: 2026,
+            month: 3,
+            day: 17,
+            hour: 3,
+            minute: 30
+        )))
+
+        let evaluation = schedule.evaluate(
+            now: now,
+            lastScheduledAttemptAt: nil,
+            calendar: calendar
+        )
+
+        #expect(evaluation.shouldRunNow)
+    }
+
+    @Test
+    func dailyScheduleSkipsSecondAttemptOnSameDay() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .current
+        let schedule = AutoSyncSchedule.daily(time: DailySyncTime(hour: 2, minute: 0))
+        let now = try #require(calendar.date(from: DateComponents(
+            year: 2026,
+            month: 3,
+            day: 17,
+            hour: 8,
+            minute: 0
+        )))
+        let attemptedAt = try #require(calendar.date(from: DateComponents(
+            year: 2026,
+            month: 3,
+            day: 17,
+            hour: 2,
+            minute: 5
+        )))
+        let expectedNextCheck = try #require(calendar.date(from: DateComponents(
+            year: 2026,
+            month: 3,
+            day: 18,
+            hour: 2,
+            minute: 0
+        )))
+
+        let evaluation = schedule.evaluate(
+            now: now,
+            lastScheduledAttemptAt: attemptedAt,
+            calendar: calendar
+        )
+
+        #expect(evaluation.shouldRunNow == false)
+        #expect(evaluation.nextCheckAt == expectedNextCheck)
     }
 }
