@@ -64,6 +64,79 @@ struct SyncPlannerTests {
     }
 
     @Test
+    func allowlistMatchesExactNamesCaseInsensitively() {
+        let recent = PlaylistSnapshot(
+            name: "Recently Added",
+            persistentID: "RECENT",
+            specialKind: "none",
+            isSmart: true,
+            trackPersistentIDs: []
+        )
+        let roadTrip = PlaylistSnapshot(
+            name: "Road Trip Mix",
+            persistentID: "ROAD",
+            specialKind: "none",
+            isSmart: true,
+            trackPersistentIDs: []
+        )
+
+        let evaluation = SyncPlanner.evaluateSmartPlaylists(
+            from: [recent, roadTrip],
+            includeSystemPlaylists: false,
+            exclusionRules: [],
+            allowedSourcePlaylistNames: ["recently added"]
+        )
+
+        #expect(evaluation.included == [recent])
+        #expect(evaluation.excludedByAllowlist == [roadTrip])
+    }
+
+    @Test
+    func emptyAllowlistExcludesAllEligiblePlaylists() {
+        let recent = PlaylistSnapshot(
+            name: "Recently Added",
+            persistentID: "RECENT",
+            specialKind: "none",
+            isSmart: true,
+            trackPersistentIDs: []
+        )
+
+        let evaluation = SyncPlanner.evaluateSmartPlaylists(
+            from: [recent],
+            includeSystemPlaylists: false,
+            exclusionRules: [],
+            allowedSourcePlaylistNames: []
+        )
+
+        #expect(evaluation.included.isEmpty)
+        #expect(evaluation.excludedByAllowlist == [recent])
+        #expect(evaluation.protectedSourceIDs == Set(["RECENT"]))
+    }
+
+    @Test
+    func exclusionRulesTakePrecedenceOverAllowlist() {
+        let favoriteSongs = PlaylistSnapshot(
+            name: "Favorite Songs",
+            persistentID: "FAVORITE",
+            specialKind: "none",
+            isSmart: true,
+            trackPersistentIDs: []
+        )
+
+        let evaluation = SyncPlanner.evaluateSmartPlaylists(
+            from: [favoriteSongs],
+            includeSystemPlaylists: false,
+            exclusionRules: [PlaylistExclusionRule(matchType: .exactName, value: "Favorite Songs")],
+            allowedSourcePlaylistNames: ["Favorite Songs"]
+        )
+
+        #expect(evaluation.included.isEmpty)
+        #expect(evaluation.excludedByRules == [favoriteSongs])
+        #expect(evaluation.excludedByAllowlist.isEmpty)
+        #expect(evaluation.protectedSourceIDs == Set(["FAVORITE"]))
+    }
+
+    @Test
     func dailyScheduleRunsAfterDueTimeWhenNoAttemptWasRecorded() throws {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .current

@@ -994,7 +994,8 @@ private func runDiscoveryDebug(options: DiscoveryDebugOptions) async throws {
     let playlistEvaluation = SyncPlanner.evaluateSmartPlaylists(
         from: smartPlaylistSnapshots,
         includeSystemPlaylists: config.includeSystemSmartPlaylists,
-        exclusionRules: config.sourcePlaylistExclusions
+        exclusionRules: config.sourcePlaylistExclusions,
+        allowedSourcePlaylistNames: config.allowedSourcePlaylistNames
     )
     let includedIDs = Set(playlistEvaluation.included.map { $0.persistentID })
     let ruleExcludedIDs = Set(playlistEvaluation.excludedByRules.map { $0.persistentID })
@@ -1152,10 +1153,12 @@ func runChecks() async throws {
     let evaluation = SyncPlanner.evaluateSmartPlaylists(
         from: [userPlaylist, favoriteSongsPlaylist, systemPlaylist],
         includeSystemPlaylists: false,
-        exclusionRules: [PlaylistExclusionRule(matchType: .exactName, value: "favorite songs")]
+        exclusionRules: [PlaylistExclusionRule(matchType: .exactName, value: "favorite songs")],
+        allowedSourcePlaylistNames: ["Recently Added"]
     )
     try expect(evaluation.included == [userPlaylist], "Only non-system, non-excluded smart playlists should remain included.")
     try expect(evaluation.excludedByRules == [favoriteSongsPlaylist], "Favorite Songs should be excluded by explicit rule.")
+    try expect(evaluation.excludedByAllowlist.isEmpty, "The allowlist should not exclude the selected playlist.")
     try expect(evaluation.excludedBySystemFilter == [systemPlaylist], "System smart playlists should still be excluded by the system toggle.")
     try expect(evaluation.protectedSourceIDs == Set(["USER", "FAVORITE"]), "Explicit exclusions should remain protected from stale cleanup.")
 

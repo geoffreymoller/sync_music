@@ -3,20 +3,23 @@ import Foundation
 public struct PlaylistFilterEvaluation: Equatable, Sendable {
     public let included: [PlaylistSnapshot]
     public let excludedByRules: [PlaylistSnapshot]
+    public let excludedByAllowlist: [PlaylistSnapshot]
     public let excludedBySystemFilter: [PlaylistSnapshot]
 
     public init(
         included: [PlaylistSnapshot],
         excludedByRules: [PlaylistSnapshot],
+        excludedByAllowlist: [PlaylistSnapshot],
         excludedBySystemFilter: [PlaylistSnapshot]
     ) {
         self.included = included
         self.excludedByRules = excludedByRules
+        self.excludedByAllowlist = excludedByAllowlist
         self.excludedBySystemFilter = excludedBySystemFilter
     }
 
     public var protectedSourceIDs: Set<String> {
-        Set(included.map(\.persistentID) + excludedByRules.map(\.persistentID))
+        Set(included.map(\.persistentID) + excludedByRules.map(\.persistentID) + excludedByAllowlist.map(\.persistentID))
     }
 }
 
@@ -24,11 +27,14 @@ public enum SyncPlanner {
     public static func evaluateSmartPlaylists(
         from playlists: [PlaylistSnapshot],
         includeSystemPlaylists: Bool,
-        exclusionRules: [PlaylistExclusionRule]
+        exclusionRules: [PlaylistExclusionRule],
+        allowedSourcePlaylistNames: [String]
     ) -> PlaylistFilterEvaluation {
         var included: [PlaylistSnapshot] = []
         var excludedByRules: [PlaylistSnapshot] = []
+        var excludedByAllowlist: [PlaylistSnapshot] = []
         var excludedBySystemFilter: [PlaylistSnapshot] = []
+        let allowedNameKeys = Set(allowedSourcePlaylistNames.map(normalizedPlaylistNameKey))
 
         for snapshot in playlists {
             if includeSystemPlaylists == false && snapshot.isSystemSmartPlaylist {
@@ -41,12 +47,18 @@ public enum SyncPlanner {
                 continue
             }
 
+            if allowedNameKeys.contains(normalizedPlaylistNameKey(snapshot.name)) == false {
+                excludedByAllowlist.append(snapshot)
+                continue
+            }
+
             included.append(snapshot)
         }
 
         return PlaylistFilterEvaluation(
             included: included,
             excludedByRules: excludedByRules,
+            excludedByAllowlist: excludedByAllowlist,
             excludedBySystemFilter: excludedBySystemFilter
         )
     }
@@ -54,13 +66,21 @@ public enum SyncPlanner {
     public static func filteredSmartPlaylists(
         from playlists: [PlaylistSnapshot],
         includeSystemPlaylists: Bool,
-        exclusionRules: [PlaylistExclusionRule] = []
+        exclusionRules: [PlaylistExclusionRule] = [],
+        allowedSourcePlaylistNames: [String] = AppConfig.defaultAllowedSourcePlaylistNames
     ) -> [PlaylistSnapshot] {
         evaluateSmartPlaylists(
             from: playlists,
             includeSystemPlaylists: includeSystemPlaylists,
-            exclusionRules: exclusionRules
+            exclusionRules: exclusionRules,
+            allowedSourcePlaylistNames: allowedSourcePlaylistNames
         ).included
+    }
+
+    private static func normalizedPlaylistNameKey(_ name: String) -> String {
+        name
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
     }
 
     public static func chunkedTrackIDs(_ trackIDs: [String], limit: Int?) -> [[String]] {

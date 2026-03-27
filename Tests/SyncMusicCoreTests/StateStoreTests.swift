@@ -13,6 +13,7 @@ struct StateStoreTests {
             autoSyncSchedule: .daily(time: DailySyncTime(hour: 2, minute: 15)),
             materializedPrefix: "Managed",
             includeSystemSmartPlaylists: true,
+            allowedSourcePlaylistNames: ["Recently Added", "Road Trip"],
             providerProfile: .generic,
             deleteStaleManagedPlaylists: false
         )
@@ -84,5 +85,15 @@ struct StateStoreTests {
         let config = try decoder.decode(AppConfig.self, from: Data(json.utf8))
 
         #expect(config.autoSyncSchedule == .interval(minutes: 45))
+        #expect(config.allowedSourcePlaylistNames == ["Recently Added"])
+    }
+
+    @Test
+    func appConfigNormalizesAllowedSourcePlaylistNames() {
+        let config = AppConfig(
+            allowedSourcePlaylistNames: [" Recently Added ", "", "recently added", "Road Trip", "ROAD TRIP"]
+        )
+
+        #expect(config.allowedSourcePlaylistNames == ["Recently Added", "Road Trip"])
     }
 }

@@ -171,6 +171,10 @@ public actor DiagnosticsLogger {
         lines.append("- Schedule: \(config.autoSyncSchedule.displayDescription)")
         lines.append("- Prefix: \(config.materializedPrefix)")
         lines.append("- Include system playlists: \(config.includeSystemSmartPlaylists)")
+        lines.append("- Allowed source playlists: \(config.allowedSourcePlaylistNames.count)")
+        for playlistName in config.allowedSourcePlaylistNames.prefix(8) {
+            lines.append("  • \(playlistName)")
+        }
         lines.append("- Source exclusions: \(config.sourcePlaylistExclusions.filter(\.isEnabled).count)")
         for rule in config.sourcePlaylistExclusions.filter(\.isEnabled).prefix(8) {
             lines.append("  • \(rule.displayDescription)")

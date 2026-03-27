@@ -302,7 +302,8 @@ public actor SyncEngine {
         let playlistEvaluation = SyncPlanner.evaluateSmartPlaylists(
             from: discoveredSmartPlaylists,
             includeSystemPlaylists: config.includeSystemSmartPlaylists,
-            exclusionRules: config.sourcePlaylistExclusions
+            exclusionRules: config.sourcePlaylistExclusions,
+            allowedSourcePlaylistNames: config.allowedSourcePlaylistNames
         )
 
         let sourcePlaylistMetadata = playlistEvaluation.included.sorted {
@@ -330,6 +331,27 @@ public actor SyncEngine {
             )
         }
 
+        if playlistEvaluation.excludedByAllowlist.isEmpty == false {
+            let excludedNames = playlistEvaluation.excludedByAllowlist
+                .prefix(10)
+                .map(\.name)
+                .joined(separator: ", ")
+            await diagnostics.log(
+                SyncEvent(
+                    level: .info,
+                    subsystem: "sync",
+                    operation: "sync.allowlistPlaylists",
+                    runID: runContext.runID,
+                    trigger: trigger,
+                    message: "Skipping \(playlistEvaluation.excludedByAllowlist.count) smart playlist(s) due to the source allowlist.",
+                    metadata: [
+                        "playlistCount": "\(playlistEvaluation.excludedByAllowlist.count)",
+                        "playlistNames": excludedNames,
+                    ]
+                )
+            )
+        }
+
         await diagnostics.log(
             SyncEvent(
                 level: .info,
@@ -341,6 +363,7 @@ public actor SyncEngine {
                 metadata: [
                     "playlistCount": "\(sourcePlaylistMetadata.count)",
                     "excludedByRuleCount": "\(playlistEvaluation.excludedByRules.count)",
+                    "excludedByAllowlistCount": "\(playlistEvaluation.excludedByAllowlist.count)",
                     "excludedBySystemCount": "\(playlistEvaluation.excludedBySystemFilter.count)",
                 ]
             )

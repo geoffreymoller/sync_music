@@ -475,6 +475,7 @@ public struct AppConfig: Codable, Equatable, Sendable {
     public var materializedPrefix: String
     public var includeSystemSmartPlaylists: Bool
     public var sourcePlaylistExclusions: [PlaylistExclusionRule]
+    public var allowedSourcePlaylistNames: [String]
     public var providerProfile: ProviderProfile
     public var deleteStaleManagedPlaylists: Bool
     public var logLevel: LogLevel
@@ -489,11 +490,16 @@ public struct AppConfig: Codable, Equatable, Sendable {
         ]
     }
 
+    public static var defaultAllowedSourcePlaylistNames: [String] {
+        ["Recently Added"]
+    }
+
     public init(
         autoSyncSchedule: AutoSyncSchedule = .interval(minutes: 30),
         materializedPrefix: String = "Sync Mirror",
         includeSystemSmartPlaylists: Bool = false,
         sourcePlaylistExclusions: [PlaylistExclusionRule] = AppConfig.defaultSourcePlaylistExclusions,
+        allowedSourcePlaylistNames: [String] = AppConfig.defaultAllowedSourcePlaylistNames,
         providerProfile: ProviderProfile = .qobuzViaSoundiiz,
         deleteStaleManagedPlaylists: Bool = false,
         logLevel: LogLevel = .info,
@@ -505,6 +511,7 @@ public struct AppConfig: Codable, Equatable, Sendable {
         self.materializedPrefix = materializedPrefix
         self.includeSystemSmartPlaylists = includeSystemSmartPlaylists
         self.sourcePlaylistExclusions = sourcePlaylistExclusions
+        self.allowedSourcePlaylistNames = AppConfig.normalizedAllowedSourcePlaylistNames(from: allowedSourcePlaylistNames)
         self.providerProfile = providerProfile
         self.deleteStaleManagedPlaylists = deleteStaleManagedPlaylists
         self.logLevel = logLevel
@@ -529,6 +536,7 @@ public struct AppConfig: Codable, Equatable, Sendable {
         case materializedPrefix
         case includeSystemSmartPlaylists
         case sourcePlaylistExclusions
+        case allowedSourcePlaylistNames
         case providerProfile
         case deleteStaleManagedPlaylists
         case logLevel
@@ -549,6 +557,10 @@ public struct AppConfig: Codable, Equatable, Sendable {
         includeSystemSmartPlaylists = try container.decodeIfPresent(Bool.self, forKey: .includeSystemSmartPlaylists) ?? false
         sourcePlaylistExclusions = try container.decodeIfPresent([PlaylistExclusionRule].self, forKey: .sourcePlaylistExclusions)
             ?? AppConfig.defaultSourcePlaylistExclusions
+        allowedSourcePlaylistNames = AppConfig.normalizedAllowedSourcePlaylistNames(
+            from: try container.decodeIfPresent([String].self, forKey: .allowedSourcePlaylistNames)
+                ?? AppConfig.defaultAllowedSourcePlaylistNames
+        )
         providerProfile = try container.decodeIfPresent(ProviderProfile.self, forKey: .providerProfile) ?? .qobuzViaSoundiiz
         deleteStaleManagedPlaylists = try container.decodeIfPresent(Bool.self, forKey: .deleteStaleManagedPlaylists) ?? false
         logLevel = try container.decodeIfPresent(LogLevel.self, forKey: .logLevel) ?? .info
@@ -563,12 +575,34 @@ public struct AppConfig: Codable, Equatable, Sendable {
         try container.encode(materializedPrefix, forKey: .materializedPrefix)
         try container.encode(includeSystemSmartPlaylists, forKey: .includeSystemSmartPlaylists)
         try container.encode(sourcePlaylistExclusions, forKey: .sourcePlaylistExclusions)
+        try container.encode(allowedSourcePlaylistNames, forKey: .allowedSourcePlaylistNames)
         try container.encode(providerProfile, forKey: .providerProfile)
         try container.encode(deleteStaleManagedPlaylists, forKey: .deleteStaleManagedPlaylists)
         try container.encode(logLevel, forKey: .logLevel)
         try container.encode(debugLogging, forKey: .debugLogging)
         try container.encode(maxLogFileSizeBytes, forKey: .maxLogFileSizeBytes)
         try container.encode(maxRotatedLogFiles, forKey: .maxRotatedLogFiles)
+    }
+
+    private static func normalizedAllowedSourcePlaylistNames(from names: [String]) -> [String] {
+        var normalizedNames: [String] = []
+        var seenKeys: Set<String> = []
+
+        for name in names {
+            let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmedName.isEmpty == false else {
+                continue
+            }
+
+            let foldedName = trimmedName.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            guard seenKeys.insert(foldedName).inserted else {
+                continue
+            }
+
+            normalizedNames.append(trimmedName)
+        }
+
+        return normalizedNames
     }
 }
 
