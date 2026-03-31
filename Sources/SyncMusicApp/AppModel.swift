@@ -231,6 +231,97 @@ final class AppModel: ObservableObject {
         return "\(runLabel) • \(triggerLabel)"
     }
 
+    var menuStatusHeadline: String {
+        if isSyncing {
+            let triggerLabel = activeRunTrigger?.displayName ?? "Sync"
+            return "\(triggerLabel) sync in progress"
+        }
+
+        if let lastReport {
+            return lastReport.failures.isEmpty ? "Last sync succeeded" : "Last sync had issues"
+        }
+
+        return "Ready to sync"
+    }
+
+    var menuStatusSubtitle: String {
+        if isSyncing {
+            return activeRunStartedAt.map { "Started \($0.formatted(date: .omitted, time: .shortened))" }
+                ?? "Preparing sync"
+        }
+
+        if let lastReport {
+            return "Updated \(lastReport.finishedAt.formatted(date: .abbreviated, time: .shortened))"
+        }
+
+        return "No sync completed yet"
+    }
+
+    var menuActiveRunTitle: String {
+        let triggerLabel = activeRunTrigger?.displayName ?? "Sync"
+        return "\(triggerLabel) Sync"
+    }
+
+    var menuActiveRunSubtitle: String {
+        activeRunStartedAt.map { "Started \($0.formatted(date: .abbreviated, time: .shortened))" }
+            ?? "Starting now"
+    }
+
+    var menuActiveRunMetrics: String {
+        let playlistLabel = activeProcessedPlaylistCount == 1 ? "playlist" : "playlists"
+        return "\(activeProcessedPlaylistCount) \(playlistLabel) processed"
+    }
+
+    var menuLastRunTitle: String {
+        guard let lastReport else {
+            return "No completed sync yet"
+        }
+
+        return "Last \(lastReport.trigger.displayName) Sync"
+    }
+
+    var menuLastRunSubtitle: String {
+        guard let lastReport else {
+            return "Run Sync Now to create your first mirror."
+        }
+
+        return lastReport.finishedAt.formatted(date: .abbreviated, time: .shortened)
+    }
+
+    var menuLastRunMetrics: String {
+        guard let lastReport else {
+            return "No playlists processed"
+        }
+
+        let playlistLabel = lastReport.processedPlaylistCount == 1 ? "playlist" : "playlists"
+        return "\(lastReport.processedPlaylistCount) \(playlistLabel) in \(formattedDuration(milliseconds: lastReport.durationMilliseconds))"
+    }
+
+    var menuLastRunDetail: String? {
+        guard let lastReport else {
+            return nil
+        }
+
+        if lastReport.failures.isEmpty {
+            return "Healthy"
+        }
+
+        let issueLabel = lastReport.failures.count == 1 ? "issue" : "issues"
+        return "\(lastReport.failures.count) \(issueLabel)"
+    }
+
+    var menuHealthSummary: String? {
+        guard recentFailures.isEmpty == false else {
+            return nil
+        }
+
+        if recentFailures.count == 1, let failure = recentFailures.first {
+            return "1 recent failure in \(failure.playlistName)"
+        }
+
+        return "\(recentFailures.count) recent failures. Open logs for details."
+    }
+
     var activeRunStartedText: String? {
         activeRunStartedAt.map {
             "Started \($0.formatted(date: .abbreviated, time: .shortened))"
@@ -458,5 +549,20 @@ final class AppModel: ObservableObject {
             )
         }
         restartScheduler(runStartupSync: false)
+    }
+
+    private func formattedDuration(milliseconds: Int) -> String {
+        let seconds = Double(milliseconds) / 1_000
+        if seconds < 1 {
+            return "\(milliseconds) ms"
+        }
+
+        if seconds < 60 {
+            return String(format: "%.1fs", seconds)
+        }
+
+        let minutes = Int(seconds) / 60
+        let remainingSeconds = Int(seconds) % 60
+        return "\(minutes)m \(remainingSeconds)s"
     }
 }

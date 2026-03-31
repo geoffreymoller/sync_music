@@ -12,147 +12,257 @@ struct MenuContentView: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("SyncMusic")
-                .font(.headline)
+        VStack(alignment: .leading, spacing: 10) {
+            MenuHeaderSection(model: model)
+            RunSummaryCard(model: model)
 
-            Text(model.statusText)
-                .font(.subheadline.weight(.semibold))
-
-            Text(model.currentStepText)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Text("Last completed: \(model.lastCompletedStepText)")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-
-            if model.isSyncing {
-                Divider()
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(model.activeRunSummaryTitle)
-                        .font(.caption.weight(.semibold))
-                    if let activeRunStartedText = model.activeRunStartedText {
-                        Text(activeRunStartedText)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                    Text(model.activeRunProgressText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    if let activeRunPlaylistText = model.activeRunPlaylistText {
-                        Text(activeRunPlaylistText)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-            } else if let lastReport = model.lastReport {
-                Divider()
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Run \(lastReport.runID.suffix(8)) • \(lastReport.trigger.displayName)")
-                        .font(.caption.weight(.semibold))
-                    Text(lastReport.finishedAt.formatted(date: .abbreviated, time: .shortened))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    Text("Processed \(lastReport.processedPlaylistCount) playlists in \(lastReport.durationMilliseconds) ms")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text("Rebuilt \(lastReport.rebuiltPlaylistPartCount) parts • Wrote \(lastReport.writtenTrackCount) tracks")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text("Playlists +\(lastReport.createdPlaylistCount) / -\(lastReport.deletedPlaylistCount) / rename \(lastReport.renamedPlaylistCount)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+            if let healthSummary = model.menuHealthSummary {
+                HealthBanner(summary: healthSummary)
             }
 
-            Divider()
+            MenuActionSection(model: model)
+        }
+        .padding(12)
+        .frame(width: 320)
+    }
+}
 
-            if model.managedPlaylists.isEmpty {
-                Text("No managed playlists yet.")
+private enum MenuStatusTone {
+    case syncing
+    case warning
+    case healthy
+    case idle
+
+    @MainActor
+    init(model: AppModel) {
+        if model.isSyncing {
+            self = .syncing
+        } else if model.menuHealthSummary != nil {
+            self = .warning
+        } else if model.lastReport != nil {
+            self = .healthy
+        } else {
+            self = .idle
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .syncing:
+            return "arrow.trianglehead.2.clockwise"
+        case .warning:
+            return "exclamationmark.triangle.fill"
+        case .healthy:
+            return "checkmark.circle.fill"
+        case .idle:
+            return "music.note.list"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .syncing:
+            return .accentColor
+        case .warning:
+            return .orange
+        case .healthy:
+            return .green
+        case .idle:
+            return .secondary
+        }
+    }
+}
+
+private struct MenuHeaderSection: View {
+    @ObservedObject var model: AppModel
+
+    private var tone: MenuStatusTone {
+        MenuStatusTone(model: model)
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: tone.symbolName)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(tone.tint)
+                .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("SyncMusic")
+                    .font(.system(size: 13, weight: .semibold))
+
+                Text(model.menuStatusHeadline)
+                    .font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1)
+
+                Text(model.menuStatusSubtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            } else {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(model.managedPlaylists.prefix(6)) { playlist in
-                        HStack(alignment: .firstTextBaseline) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(playlist.sourceName)
-                                    .lineLimit(1)
-                                if let lastError = playlist.lastError {
-                                    Text(lastError)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                }
-                            }
-                            Spacer()
-                            Text("\(playlist.parts.count)")
-                                .foregroundStyle(.secondary)
-                                .font(.caption)
-                        }
-                        .font(.caption)
-                    }
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 0)
+
+            if model.isSyncing {
+                ProgressView()
+                    .controlSize(.small)
+                    .padding(.top, 2)
+            }
+        }
+    }
+}
+
+private struct RunSummaryCard: View {
+    @ObservedObject var model: AppModel
+
+    private var backgroundTint: Color {
+        model.isSyncing ? .accentColor.opacity(0.12) : .primary.opacity(0.05)
+    }
+
+    private var borderTint: Color {
+        model.isSyncing ? .accentColor.opacity(0.2) : .primary.opacity(0.08)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Label(title, systemImage: model.isSyncing ? "dot.radiowaves.left.and.right" : "clock")
+                    .font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1)
+
+                Spacer(minLength: 0)
+
+                if let detail = trailingDetail {
+                    Text(detail)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
             }
 
-            if !model.recentFailures.isEmpty {
-                Divider()
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Recent failures")
-                        .font(.caption.weight(.semibold))
-                    ForEach(model.recentFailures) { failure in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("[\(failure.category.rawValue)] \(failure.playlistName)")
-                                .font(.caption)
-                                .bold()
-                            Text(failure.message)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(3)
-                        }
-                    }
+            Text(subtitle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+
+            Text(metrics)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+
+            if let playlistLine {
+                Label {
+                    Text(playlistLine)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                } icon: {
+                    Image(systemName: "music.note.list")
                 }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(backgroundTint)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(borderTint, lineWidth: 1)
+        )
+    }
+
+    private var title: String {
+        model.isSyncing ? model.menuActiveRunTitle : model.menuLastRunTitle
+    }
+
+    private var subtitle: String {
+        model.isSyncing ? model.menuActiveRunSubtitle : model.menuLastRunSubtitle
+    }
+
+    private var metrics: String {
+        model.isSyncing ? model.menuActiveRunMetrics : model.menuLastRunMetrics
+    }
+
+    private var trailingDetail: String? {
+        model.isSyncing ? nil : model.menuLastRunDetail
+    }
+
+    private var playlistLine: String? {
+        guard model.isSyncing else {
+            return nil
+        }
+
+        return model.activeCurrentPlaylistName.map { "Current: \($0)" }
+    }
+}
+
+private struct HealthBanner: View {
+    let summary: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+
+            Text(summary)
+                .font(.caption)
+                .lineLimit(2)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.orange.opacity(0.12))
+        )
+    }
+}
+
+private struct MenuActionSection: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Button {
+                    model.syncNow()
+                } label: {
+                    Label(model.isSyncing ? "Syncing…" : "Sync Now", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(model.isSyncing)
+
+                SettingsLink {
+                    Label("Settings…", systemImage: "gearshape")
+                }
+                .buttonStyle(.bordered)
             }
 
-            Divider()
-
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Button(model.isSyncing ? "Syncing…" : "Sync Now") {
-                        model.syncNow()
-                    }
-                    .disabled(model.isSyncing)
-
-                    SettingsLink {
-                        Text("Settings…")
-                    }
-
-                    Spacer()
-
-                    Button("Quit") {
-                        model.quit()
-                    }
+            Menu {
+                Button("View Logs") {
+                    model.viewLogs()
                 }
 
-                HStack {
-                    Button("View Logs") {
-                        model.viewLogs()
-                    }
-
-                    Button("Open Diagnostics Folder") {
-                        model.openDiagnosticsFolder()
-                    }
+                Button("Open Diagnostics Folder") {
+                    model.openDiagnosticsFolder()
                 }
 
                 Button("Copy Diagnostics Summary") {
                     model.copyDiagnosticsSummary()
                 }
+
+                Divider()
+
+                Button("Quit") {
+                    model.quit()
+                }
+            } label: {
+                Label("More", systemImage: "ellipsis.circle")
             }
+            .menuStyle(.borderlessButton)
         }
-        .padding(14)
-        .frame(width: 440)
+        .controlSize(.small)
     }
 }
 
