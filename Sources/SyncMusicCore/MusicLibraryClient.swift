@@ -5,6 +5,8 @@ public final class MusicLibraryClient: @unchecked Sendable {
     private let diagnostics: DiagnosticsLogger
     private let unitSeparator = "\u{001F}"
     private let recordSeparator = "\u{001E}"
+    private let trackSeparator = "\u{001D}"
+    private let trackFieldSeparator = "\u{001C}"
     private let slowSnapshotThresholdMilliseconds = 10_000
 
     public init(
@@ -23,7 +25,7 @@ public final class MusicLibraryClient: @unchecked Sendable {
             runContext: runContext,
             messageOnSuccess: "Enumerated smart playlists."
         )
-        let playlists = parsePlaylistRows(result.stdoutText, isSmart: true)
+        let playlists = parsePlaylistRows(result.stdoutText, defaultSourceKind: .smart)
         await diagnostics.log(
             SyncEvent(
                 level: .info,
@@ -48,7 +50,7 @@ public final class MusicLibraryClient: @unchecked Sendable {
             runContext: runContext,
             messageOnSuccess: "Enumerated smart playlist metadata."
         )
-        let playlists = parsePlaylistRows(result.stdoutText, isSmart: true)
+        let playlists = parsePlaylistRows(result.stdoutText, defaultSourceKind: .smart)
         await diagnostics.log(
             SyncEvent(
                 level: .info,
@@ -57,6 +59,30 @@ public final class MusicLibraryClient: @unchecked Sendable {
                 runID: runContext?.runID,
                 trigger: runContext?.trigger,
                 message: "Discovered metadata for \(playlists.count) smart playlists.",
+                durationMilliseconds: result.durationMilliseconds,
+                metadata: ["playlistCount": "\(playlists.count)"]
+            )
+        )
+        return playlists
+    }
+
+    public func listSourcePlaylistMetadata(runContext: RunContext?) async throws -> [PlaylistSnapshot] {
+        let result = try await runMusicScript(
+            operation: "music.listSourcePlaylistMetadata",
+            script: userPlaylistMetadataScript,
+            arguments: [],
+            runContext: runContext,
+            messageOnSuccess: "Enumerated source playlist metadata."
+        )
+        let playlists = parsePlaylistRows(result.stdoutText)
+        await diagnostics.log(
+            SyncEvent(
+                level: .info,
+                subsystem: "music",
+                operation: "music.listSourcePlaylistMetadata",
+                runID: runContext?.runID,
+                trigger: runContext?.trigger,
+                message: "Discovered metadata for \(playlists.count) source playlists.",
                 durationMilliseconds: result.durationMilliseconds,
                 metadata: ["playlistCount": "\(playlists.count)"]
             )
@@ -81,7 +107,7 @@ public final class MusicLibraryClient: @unchecked Sendable {
             messageOnSuccess: "Loaded playlist snapshot."
         )
 
-        guard let snapshot = parsePlaylistRows(result.stdoutText, isSmart: false).first else {
+        guard let snapshot = parsePlaylistRows(result.stdoutText).first else {
             let message = "Music did not return playlist \(persistentID)."
             let category = FailureCategory.playlistLookupFailed
             await diagnostics.log(
@@ -361,7 +387,7 @@ public final class MusicLibraryClient: @unchecked Sendable {
         }
     }
 
-    private func parsePlaylistRows(_ output: String, isSmart: Bool) -> [PlaylistSnapshot] {
+    private func parsePlaylistRows(_ output: String, defaultSourceKind: SourcePlaylistKind? = nil) -> [PlaylistSnapshot] {
         guard !output.isEmpty else {
             return []
         }
@@ -377,18 +403,57 @@ public final class MusicLibraryClient: @unchecked Sendable {
                 let persistentID = String(fields[0])
                 let name = String(fields[1])
                 let specialKind = String(fields[2])
-                let trackIDs = String(fields[3])
-                    .split(separator: ",", omittingEmptySubsequences: true)
-                    .map(String.init)
+                let sourceKind: SourcePlaylistKind
+                let trackPayload: String
+
+                if fields.count >= 5 {
+                    sourceKind = SourcePlaylistKind(rawValue: String(fields[3])) ?? defaultSourceKind ?? .regular
+                    trackPayload = String(fields[4])
+                } else {
+                    sourceKind = defaultSourceKind ?? .regular
+                    trackPayload = String(fields[3])
+                }
+
+                let tracks = parseTracks(trackPayload)
 
                 return PlaylistSnapshot(
                     name: name,
                     persistentID: persistentID,
                     specialKind: specialKind,
-                    isSmart: isSmart,
-                    trackPersistentIDs: trackIDs
+                    sourceKind: sourceKind,
+                    tracks: tracks
                 )
             }
+    }
+
+    private func parseTracks(_ payload: String) -> [TrackSnapshot] {
+        guard payload.isEmpty == false else {
+            return []
+        }
+
+        if payload.contains(trackSeparator) || payload.contains(trackFieldSeparator) {
+            return payload
+                .split(separator: Character(trackSeparator), omittingEmptySubsequences: true)
+                .compactMap { row in
+                    let fields = row.split(separator: Character(trackFieldSeparator), omittingEmptySubsequences: false)
+                    guard fields.count >= 4 else {
+                        return nil
+                    }
+
+                    let isrc = fields.count > 4 ? String(fields[4]) : nil
+                    return TrackSnapshot(
+                        persistentID: String(fields[0]),
+                        title: String(fields[1]),
+                        artist: String(fields[2]),
+                        album: String(fields[3]),
+                        isrc: isrc
+                    )
+                }
+        }
+
+        return payload
+            .split(separator: ",", omittingEmptySubsequences: true)
+            .map { TrackSnapshot(persistentID: String($0)) }
     }
 
     private func truncate(_ value: String, maximumLength: Int = 240) -> String? {
@@ -428,6 +493,39 @@ public final class MusicLibraryClient: @unchecked Sendable {
             set AppleScript's text item delimiters to oldDelimiters
             return outputList
         end splitCSV
+
+        on serializeTracks(trackList, trackSep, fieldSep)
+            set serializedTracks to {}
+
+            repeat with currentTrack in trackList
+                try
+                    set trackPersistentID to ""
+                    try
+                        set trackPersistentID to (persistent ID of currentTrack as text)
+                    end try
+
+                    set trackName to ""
+                    try
+                        set trackName to (name of currentTrack as text)
+                    end try
+
+                    set trackArtist to ""
+                    try
+                        set trackArtist to (artist of currentTrack as text)
+                    end try
+
+                    set trackAlbum to ""
+                    try
+                        set trackAlbum to (album of currentTrack as text)
+                    end try
+
+                    set trackISRC to ""
+                    set end of serializedTracks to trackPersistentID & fieldSep & trackName & fieldSep & trackArtist & fieldSep & trackAlbum & fieldSep & trackISRC
+                end try
+            end repeat
+
+            return my joinList(serializedTracks, trackSep)
+        end serializeTracks
         """
     }
 
@@ -440,6 +538,8 @@ public final class MusicLibraryClient: @unchecked Sendable {
         on run argv
             set unitSep to character id 31
             set recordSep to character id 30
+            set trackSep to character id 29
+            set fieldSep to character id 28
             set playlistRows to {}
 
             tell application "Music"
@@ -450,8 +550,8 @@ public final class MusicLibraryClient: @unchecked Sendable {
                             try
                                 set specialKind to (special kind of candidatePlaylist as text)
                             end try
-                            set trackIDs to persistent ID of every track of candidatePlaylist
-                            set end of playlistRows to (persistent ID of candidatePlaylist as text) & unitSep & (name of candidatePlaylist as text) & unitSep & specialKind & unitSep & my joinList(trackIDs, ",")
+                            set serializedTracks to my serializeTracks(every track of candidatePlaylist, trackSep, fieldSep)
+                            set end of playlistRows to (persistent ID of candidatePlaylist as text) & unitSep & (name of candidatePlaylist as text) & unitSep & specialKind & unitSep & "smart" & unitSep & serializedTracks
                         end if
                     end try
                 end repeat
@@ -481,7 +581,7 @@ public final class MusicLibraryClient: @unchecked Sendable {
                             try
                                 set specialKind to (special kind of candidatePlaylist as text)
                             end try
-                            set end of playlistRows to (persistent ID of candidatePlaylist as text) & unitSep & (name of candidatePlaylist as text) & unitSep & specialKind & unitSep
+                            set end of playlistRows to (persistent ID of candidatePlaylist as text) & unitSep & (name of candidatePlaylist as text) & unitSep & specialKind & unitSep & "smart" & unitSep
                         end if
                     end try
                 end repeat
@@ -501,17 +601,25 @@ public final class MusicLibraryClient: @unchecked Sendable {
         on run argv
             set targetID to item 1 of argv
             set unitSep to character id 31
+            set trackSep to character id 29
+            set fieldSep to character id 28
             set recordText to ""
             tell application "Music"
                 repeat with candidatePlaylist in every playlist
                     try
                         if (persistent ID of candidatePlaylist as text) is targetID then
+                            set sourceKindText to "regular"
+                            try
+                                if smart of candidatePlaylist is true then
+                                    set sourceKindText to "smart"
+                                end if
+                            end try
                             set specialKind to ""
                             try
                                 set specialKind to (special kind of candidatePlaylist as text)
                             end try
-                            set trackIDs to persistent ID of every track of candidatePlaylist
-                            set recordText to (persistent ID of candidatePlaylist as text) & unitSep & (name of candidatePlaylist as text) & unitSep & specialKind & unitSep & my joinList(trackIDs, ",")
+                            set serializedTracks to my serializeTracks(every track of candidatePlaylist, trackSep, fieldSep)
+                            set recordText to (persistent ID of candidatePlaylist as text) & unitSep & (name of candidatePlaylist as text) & unitSep & specialKind & unitSep & sourceKindText & unitSep & serializedTracks
                             exit repeat
                         end if
                     end try
@@ -521,6 +629,42 @@ public final class MusicLibraryClient: @unchecked Sendable {
                 error "Playlist not found: " & targetID
             end if
             return recordText
+        end run
+        """
+    }
+
+    private var userPlaylistMetadataScript: String {
+        """
+        use AppleScript version "2.4"
+        use scripting additions
+        \(sharedHelpers)
+
+        on run argv
+            set unitSep to character id 31
+            set recordSep to character id 30
+            set playlistRows to {}
+
+            tell application "Music"
+                repeat with candidatePlaylist in every user playlist
+                    try
+                        set sourceKindText to "regular"
+                        try
+                            if smart of candidatePlaylist is true then
+                                set sourceKindText to "smart"
+                            end if
+                        end try
+
+                        set specialKind to ""
+                        try
+                            set specialKind to (special kind of candidatePlaylist as text)
+                        end try
+
+                        set end of playlistRows to (persistent ID of candidatePlaylist as text) & unitSep & (name of candidatePlaylist as text) & unitSep & specialKind & unitSep & sourceKindText & unitSep
+                    end try
+                end repeat
+            end tell
+
+            return my joinList(playlistRows, recordSep)
         end run
         """
     }

@@ -180,12 +180,15 @@ public actor DiagnosticsLogger {
             lines.append("  • \(rule.displayDescription)")
         }
         lines.append("- Provider profile: \(config.providerProfile.displayName)")
+        lines.append("- Spotify auth configured: \(config.spotifyAuth?.isConfigured == true)")
+        lines.append("- Spotify mappings: \(config.spotifyPlaylistMappings.count)")
         lines.append("- Delete stale managed playlists: \(config.deleteStaleManagedPlaylists)")
         lines.append("- Log level: \(config.logLevel.rawValue)")
         lines.append("- Debug logging: \(config.debugLogging)")
         lines.append("")
         lines.append("State")
         lines.append("- Managed sources tracked: \(state.managedPlaylists.count)")
+        lines.append("- Spotify targets tracked: \(state.spotifyPlaylists.count)")
 
         if let lastRun {
             lines.append("")

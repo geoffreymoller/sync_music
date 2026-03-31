@@ -15,6 +15,19 @@ struct StateStoreTests {
             includeSystemSmartPlaylists: true,
             allowedSourcePlaylistNames: ["Recently Added", "Road Trip"],
             providerProfile: .generic,
+            spotifyAuth: SpotifyAuthConfig(
+                clientID: "spotify-client-id",
+                redirectURI: "http://127.0.0.1:43821/callback"
+            ),
+            spotifyPlaylistMappings: [
+                SpotifyPlaylistMapping(
+                    appleSourcePersistentID: "APPLE-1",
+                    appleSourceName: "For Luke",
+                    appleSourceKind: .regular,
+                    spotifyPlaylistReference: "https://open.spotify.com/playlist/spotify-playlist-1",
+                    enabled: true
+                ),
+            ],
             deleteStaleManagedPlaylists: false
         )
 
@@ -25,6 +38,19 @@ struct StateStoreTests {
                 parts: [ManagedPlaylistPart(index: 0, targetPersistentID: "TARGET", targetName: "Managed / Recently Added")],
                 lastSourceFingerprint: "fingerprint-1",
                 lastSyncedAt: Date(timeIntervalSince1970: 1_234),
+                lastError: nil
+            ),
+        ], spotifyPlaylists: [
+            "mapping-1": SpotifyPlaylistState(
+                mappingID: "mapping-1",
+                appleSourcePersistentID: "APPLE-1",
+                appleSourceName: "For Luke",
+                spotifyPlaylistID: "SPOTIFY-1",
+                spotifyPlaylistName: "For Luke",
+                lastSourceFingerprint: "source-fingerprint",
+                lastTargetFingerprint: "target-fingerprint",
+                lastSyncedAt: Date(timeIntervalSince1970: 2_345),
+                lastUnmatchedTracks: ["Unmatched Song — Artist"],
                 lastError: nil
             ),
         ], lastScheduledAttemptAt: Date(timeIntervalSince1970: 4_321))

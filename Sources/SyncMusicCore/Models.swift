@@ -1,11 +1,65 @@
 import Foundation
 
+public enum SourcePlaylistKind: String, Codable, CaseIterable, Identifiable, Sendable {
+    case smart
+    case regular
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .smart:
+            return "Smart"
+        case .regular:
+            return "Regular"
+        }
+    }
+}
+
+public struct TrackSnapshot: Codable, Equatable, Identifiable, Sendable {
+    public let persistentID: String
+    public let title: String
+    public let artist: String
+    public let album: String
+    public let isrc: String?
+
+    public init(
+        persistentID: String,
+        title: String = "",
+        artist: String = "",
+        album: String = "",
+        isrc: String? = nil
+    ) {
+        self.persistentID = persistentID
+        self.title = title
+        self.artist = artist
+        self.album = album
+        self.isrc = isrc?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public var id: String { persistentID }
+}
+
 public struct PlaylistSnapshot: Codable, Equatable, Identifiable, Sendable {
     public let name: String
     public let persistentID: String
     public let specialKind: String
-    public let isSmart: Bool
-    public let trackPersistentIDs: [String]
+    public let sourceKind: SourcePlaylistKind
+    public let tracks: [TrackSnapshot]
+
+    public init(
+        name: String,
+        persistentID: String,
+        specialKind: String = "",
+        sourceKind: SourcePlaylistKind = .smart,
+        tracks: [TrackSnapshot]
+    ) {
+        self.name = name
+        self.persistentID = persistentID
+        self.specialKind = specialKind
+        self.sourceKind = sourceKind
+        self.tracks = tracks
+    }
 
     public init(
         name: String,
@@ -17,11 +71,19 @@ public struct PlaylistSnapshot: Codable, Equatable, Identifiable, Sendable {
         self.name = name
         self.persistentID = persistentID
         self.specialKind = specialKind
-        self.isSmart = isSmart
-        self.trackPersistentIDs = trackPersistentIDs
+        sourceKind = isSmart ? .smart : .regular
+        tracks = trackPersistentIDs.map { TrackSnapshot(persistentID: $0) }
     }
 
     public var id: String { persistentID }
+
+    public var isSmart: Bool {
+        sourceKind == .smart
+    }
+
+    public var trackPersistentIDs: [String] {
+        tracks.map(\.persistentID)
+    }
 
     public var isSystemSmartPlaylist: Bool {
         guard isSmart else { return false }
@@ -79,15 +141,110 @@ public struct ManagedPlaylistState: Codable, Equatable, Identifiable, Sendable {
 
 public struct SyncState: Codable, Equatable, Sendable {
     public var managedPlaylists: [String: ManagedPlaylistState]
+    public var spotifyPlaylists: [String: SpotifyPlaylistState]
     public var lastScheduledAttemptAt: Date?
 
     public init(
         managedPlaylists: [String: ManagedPlaylistState] = [:],
+        spotifyPlaylists: [String: SpotifyPlaylistState] = [:],
         lastScheduledAttemptAt: Date? = nil
     ) {
         self.managedPlaylists = managedPlaylists
+        self.spotifyPlaylists = spotifyPlaylists
         self.lastScheduledAttemptAt = lastScheduledAttemptAt
     }
+}
+
+public struct SpotifyAuthConfig: Codable, Equatable, Sendable {
+    public var clientID: String
+    public var redirectURI: String
+
+    public init(
+        clientID: String = "",
+        redirectURI: String = "http://127.0.0.1:43821/callback"
+    ) {
+        self.clientID = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.redirectURI = redirectURI.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public var isConfigured: Bool {
+        !clientID.isEmpty && !redirectURI.isEmpty
+    }
+}
+
+public struct SpotifyPlaylistMapping: Codable, Equatable, Identifiable, Sendable {
+    public var appleSourcePersistentID: String?
+    public var appleSourceName: String
+    public var appleSourceKind: SourcePlaylistKind
+    public var spotifyPlaylistReference: String
+    public var targetPlaylistName: String?
+    public var enabled: Bool
+
+    public init(
+        appleSourcePersistentID: String? = nil,
+        appleSourceName: String,
+        appleSourceKind: SourcePlaylistKind = .regular,
+        spotifyPlaylistReference: String = "",
+        targetPlaylistName: String? = nil,
+        enabled: Bool = true
+    ) {
+        self.appleSourcePersistentID = appleSourcePersistentID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.appleSourceName = appleSourceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.appleSourceKind = appleSourceKind
+        self.spotifyPlaylistReference = spotifyPlaylistReference.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.targetPlaylistName = targetPlaylistName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.enabled = enabled
+    }
+
+    public var id: String {
+        let sourceKey = appleSourcePersistentID?.lowercased() ?? appleSourceName.lowercased()
+        return "\(appleSourceKind.rawValue):\(sourceKey):\(spotifyPlaylistReference.lowercased())"
+    }
+}
+
+public struct SpotifyPlaylistState: Codable, Equatable, Identifiable, Sendable {
+    public var mappingID: String
+    public var appleSourcePersistentID: String?
+    public var appleSourceName: String
+    public var spotifyPlaylistID: String
+    public var spotifyPlaylistName: String?
+    public var lastSourceFingerprint: String?
+    public var lastTargetFingerprint: String?
+    public var lastSyncedAt: Date?
+    public var lastUnmatchedTracks: [String]
+    public var lastError: String?
+    public var lastFailureCategory: FailureCategory?
+    public var lastRunID: String?
+
+    public init(
+        mappingID: String,
+        appleSourcePersistentID: String? = nil,
+        appleSourceName: String,
+        spotifyPlaylistID: String,
+        spotifyPlaylistName: String? = nil,
+        lastSourceFingerprint: String? = nil,
+        lastTargetFingerprint: String? = nil,
+        lastSyncedAt: Date? = nil,
+        lastUnmatchedTracks: [String] = [],
+        lastError: String? = nil,
+        lastFailureCategory: FailureCategory? = nil,
+        lastRunID: String? = nil
+    ) {
+        self.mappingID = mappingID
+        self.appleSourcePersistentID = appleSourcePersistentID
+        self.appleSourceName = appleSourceName
+        self.spotifyPlaylistID = spotifyPlaylistID
+        self.spotifyPlaylistName = spotifyPlaylistName
+        self.lastSourceFingerprint = lastSourceFingerprint
+        self.lastTargetFingerprint = lastTargetFingerprint
+        self.lastSyncedAt = lastSyncedAt
+        self.lastUnmatchedTracks = lastUnmatchedTracks
+        self.lastError = lastError
+        self.lastFailureCategory = lastFailureCategory
+        self.lastRunID = lastRunID
+    }
+
+    public var id: String { mappingID }
 }
 
 public enum AutoSyncScheduleKind: String, Codable, CaseIterable, Identifiable, Sendable {
@@ -477,6 +634,8 @@ public struct AppConfig: Codable, Equatable, Sendable {
     public var sourcePlaylistExclusions: [PlaylistExclusionRule]
     public var allowedSourcePlaylistNames: [String]
     public var providerProfile: ProviderProfile
+    public var spotifyAuth: SpotifyAuthConfig?
+    public var spotifyPlaylistMappings: [SpotifyPlaylistMapping]
     public var deleteStaleManagedPlaylists: Bool
     public var logLevel: LogLevel
     public var debugLogging: Bool
@@ -501,6 +660,8 @@ public struct AppConfig: Codable, Equatable, Sendable {
         sourcePlaylistExclusions: [PlaylistExclusionRule] = AppConfig.defaultSourcePlaylistExclusions,
         allowedSourcePlaylistNames: [String] = AppConfig.defaultAllowedSourcePlaylistNames,
         providerProfile: ProviderProfile = .qobuzViaSoundiiz,
+        spotifyAuth: SpotifyAuthConfig? = nil,
+        spotifyPlaylistMappings: [SpotifyPlaylistMapping] = [],
         deleteStaleManagedPlaylists: Bool = false,
         logLevel: LogLevel = .info,
         debugLogging: Bool = false,
@@ -513,6 +674,8 @@ public struct AppConfig: Codable, Equatable, Sendable {
         self.sourcePlaylistExclusions = sourcePlaylistExclusions
         self.allowedSourcePlaylistNames = AppConfig.normalizedAllowedSourcePlaylistNames(from: allowedSourcePlaylistNames)
         self.providerProfile = providerProfile
+        self.spotifyAuth = spotifyAuth
+        self.spotifyPlaylistMappings = AppConfig.normalizedSpotifyPlaylistMappings(from: spotifyPlaylistMappings)
         self.deleteStaleManagedPlaylists = deleteStaleManagedPlaylists
         self.logLevel = logLevel
         self.debugLogging = debugLogging
@@ -538,6 +701,8 @@ public struct AppConfig: Codable, Equatable, Sendable {
         case sourcePlaylistExclusions
         case allowedSourcePlaylistNames
         case providerProfile
+        case spotifyAuth
+        case spotifyPlaylistMappings
         case deleteStaleManagedPlaylists
         case logLevel
         case debugLogging
@@ -562,6 +727,10 @@ public struct AppConfig: Codable, Equatable, Sendable {
                 ?? AppConfig.defaultAllowedSourcePlaylistNames
         )
         providerProfile = try container.decodeIfPresent(ProviderProfile.self, forKey: .providerProfile) ?? .qobuzViaSoundiiz
+        spotifyAuth = try container.decodeIfPresent(SpotifyAuthConfig.self, forKey: .spotifyAuth)
+        spotifyPlaylistMappings = AppConfig.normalizedSpotifyPlaylistMappings(
+            from: try container.decodeIfPresent([SpotifyPlaylistMapping].self, forKey: .spotifyPlaylistMappings) ?? []
+        )
         deleteStaleManagedPlaylists = try container.decodeIfPresent(Bool.self, forKey: .deleteStaleManagedPlaylists) ?? false
         logLevel = try container.decodeIfPresent(LogLevel.self, forKey: .logLevel) ?? .info
         debugLogging = try container.decodeIfPresent(Bool.self, forKey: .debugLogging) ?? false
@@ -577,6 +746,8 @@ public struct AppConfig: Codable, Equatable, Sendable {
         try container.encode(sourcePlaylistExclusions, forKey: .sourcePlaylistExclusions)
         try container.encode(allowedSourcePlaylistNames, forKey: .allowedSourcePlaylistNames)
         try container.encode(providerProfile, forKey: .providerProfile)
+        try container.encodeIfPresent(spotifyAuth, forKey: .spotifyAuth)
+        try container.encode(spotifyPlaylistMappings, forKey: .spotifyPlaylistMappings)
         try container.encode(deleteStaleManagedPlaylists, forKey: .deleteStaleManagedPlaylists)
         try container.encode(logLevel, forKey: .logLevel)
         try container.encode(debugLogging, forKey: .debugLogging)
@@ -603,6 +774,20 @@ public struct AppConfig: Codable, Equatable, Sendable {
         }
 
         return normalizedNames
+    }
+
+    private static func normalizedSpotifyPlaylistMappings(from mappings: [SpotifyPlaylistMapping]) -> [SpotifyPlaylistMapping] {
+        mappings.compactMap { mapping in
+            let normalized = SpotifyPlaylistMapping(
+                appleSourcePersistentID: mapping.appleSourcePersistentID,
+                appleSourceName: mapping.appleSourceName,
+                appleSourceKind: mapping.appleSourceKind,
+                spotifyPlaylistReference: mapping.spotifyPlaylistReference,
+                targetPlaylistName: mapping.targetPlaylistName,
+                enabled: mapping.enabled
+            )
+            return normalized.appleSourceName.isEmpty ? nil : normalized
+        }
     }
 }
 

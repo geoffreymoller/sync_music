@@ -5,6 +5,7 @@ public actor SyncEngine {
     private let store: StateStore
     private let musicClient: MusicLibraryClient
     private let diagnostics: DiagnosticsLogger
+    private let spotifyClient: SpotifyClient
 
     public init(
         store: StateStore = StateStore(),
@@ -14,6 +15,22 @@ public actor SyncEngine {
         self.store = store
         self.diagnostics = diagnostics
         self.musicClient = musicClient ?? MusicLibraryClient(diagnostics: diagnostics)
+        spotifyClient = SpotifyClient()
+    }
+
+    public func spotifyConnectionStatus(config: AppConfig) async -> SpotifyConnectionStatus {
+        await spotifyClient.connectionStatus(authConfig: config.spotifyAuth)
+    }
+
+    public func connectSpotify(
+        authConfig: SpotifyAuthConfig,
+        openURL: @escaping @Sendable (URL) -> Void
+    ) async throws -> SpotifyConnectionStatus {
+        try await spotifyClient.connect(authConfig: authConfig, openURL: openURL)
+    }
+
+    public func disconnectSpotify(authConfig: SpotifyAuthConfig?) async throws {
+        try await spotifyClient.disconnect(authConfig: authConfig)
     }
 
     public func loadConfig() async -> AppConfig {
@@ -807,6 +824,18 @@ public actor SyncEngine {
             }
         }
 
+        await runSpotifyMappings(
+            config: config,
+            state: &state,
+            runContext: runContext,
+            progress: progress,
+            processedPlaylistCount: &processedPlaylistCount,
+            writtenTrackCount: &writtenTrackCount,
+            createdPlaylistCount: &createdPlaylistCount,
+            failures: &failures,
+            lastCompletedStep: &lastCompletedStep
+        )
+
         await progress(
             SyncProgressUpdate(
                 runID: runContext.runID,
@@ -960,5 +989,351 @@ public actor SyncEngine {
             .joined(separator: "\u{001F}")
         let digest = SHA256.hash(data: Data(payload.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func fingerprint(for values: [String]) -> String {
+        let payload = values.joined(separator: "\u{001F}")
+        let digest = SHA256.hash(data: Data(payload.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func runSpotifyMappings(
+        config: AppConfig,
+        state: inout SyncState,
+        runContext: RunContext,
+        progress: @Sendable (SyncProgressUpdate) async -> Void,
+        processedPlaylistCount: inout Int,
+        writtenTrackCount: inout Int,
+        createdPlaylistCount: inout Int,
+        failures: inout [SyncFailure],
+        lastCompletedStep: inout String?
+    ) async {
+        let mappings = config.spotifyPlaylistMappings.filter(\.enabled)
+        guard mappings.isEmpty == false else {
+            state.spotifyPlaylists = [:]
+            return
+        }
+
+        guard let spotifyAuth = config.spotifyAuth, spotifyAuth.isConfigured else {
+            let failure = SyncFailure(
+                playlistName: "Spotify",
+                message: "Spotify sync is configured but Spotify auth is missing.",
+                category: .unknown,
+                operation: "spotify.auth.missing"
+            )
+            failures.append(failure)
+            await diagnostics.log(
+                SyncEvent(
+                    level: .error,
+                    subsystem: "spotify",
+                    operation: "spotify.auth.missing",
+                    runID: runContext.runID,
+                    trigger: runContext.trigger,
+                    message: failure.message,
+                    errorCategory: failure.category
+                )
+            )
+            return
+        }
+
+        let sourceMetadata: [PlaylistSnapshot]
+        do {
+            sourceMetadata = try await musicClient.listSourcePlaylistMetadata(runContext: runContext)
+        } catch {
+            let failure = makeFailure(
+                playlistName: "Spotify",
+                operation: "music.listSourcePlaylistMetadata",
+                error: error
+            )
+            failures.append(failure)
+            await diagnostics.log(
+                SyncEvent(
+                    level: .error,
+                    subsystem: "spotify",
+                    operation: "music.listSourcePlaylistMetadata",
+                    runID: runContext.runID,
+                    trigger: runContext.trigger,
+                    message: failure.message,
+                    errorCategory: failure.category,
+                    errorMessage: failure.underlyingMessage
+                )
+            )
+            return
+        }
+
+        var activeSpotifyStateIDs: Set<String> = []
+
+        for mapping in mappings {
+            activeSpotifyStateIDs.insert(mapping.id)
+            await progress(
+                SyncProgressUpdate(
+                    runID: runContext.runID,
+                    stage: .reconcilingPlaylist,
+                    message: "Syncing Spotify target for \(mapping.appleSourceName)…",
+                    lastCompletedStep: lastCompletedStep,
+                    currentPlaylistName: mapping.appleSourceName,
+                    processedPlaylistCount: processedPlaylistCount
+                )
+            )
+
+            let matchedSources = sourceMetadata.filter { source in
+                if let persistentID = mapping.appleSourcePersistentID?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   persistentID.isEmpty == false {
+                    return source.persistentID == persistentID
+                }
+
+                return source.sourceKind == mapping.appleSourceKind
+                    && source.name.caseInsensitiveCompare(mapping.appleSourceName) == .orderedSame
+            }
+
+            guard let sourceReference = matchedSources.first else {
+                let failure = SyncFailure(
+                    playlistName: mapping.appleSourceName,
+                    message: "Configured Apple source playlist was not found for Spotify sync.",
+                    category: .playlistLookupFailed,
+                    operation: "spotify.resolveSource"
+                )
+                failures.append(failure)
+                await diagnostics.log(
+                    SyncEvent(
+                        level: .error,
+                        subsystem: "spotify",
+                        operation: "spotify.resolveSource",
+                        runID: runContext.runID,
+                        trigger: runContext.trigger,
+                        message: failure.message,
+                        sourcePlaylistName: mapping.appleSourceName,
+                        errorCategory: failure.category
+                    )
+                )
+                processedPlaylistCount += 1
+                continue
+            }
+
+            if matchedSources.count > 1, mapping.appleSourcePersistentID?.isEmpty != false {
+                let failure = SyncFailure(
+                    playlistName: mapping.appleSourceName,
+                    message: "Multiple Apple playlists matched the configured Spotify source mapping. Set the Apple persistent ID to disambiguate.",
+                    category: .playlistLookupFailed,
+                    operation: "spotify.resolveSource"
+                )
+                failures.append(failure)
+                await diagnostics.log(
+                    SyncEvent(
+                        level: .error,
+                        subsystem: "spotify",
+                        operation: "spotify.resolveSource",
+                        runID: runContext.runID,
+                        trigger: runContext.trigger,
+                        message: failure.message,
+                        sourcePlaylistName: mapping.appleSourceName,
+                        errorCategory: failure.category
+                    )
+                )
+                processedPlaylistCount += 1
+                continue
+            }
+
+            let sourceSnapshot: PlaylistSnapshot
+            do {
+                sourceSnapshot = try await musicClient.snapshotUserPlaylist(
+                    persistentID: sourceReference.persistentID,
+                    runContext: runContext,
+                    sourcePlaylistName: sourceReference.name
+                )
+            } catch {
+                let failure = makeFailure(
+                    playlistName: sourceReference.name,
+                    operation: "music.snapshotUserPlaylist",
+                    error: error,
+                    sourcePlaylistPersistentID: sourceReference.persistentID
+                )
+                failures.append(failure)
+                await diagnostics.log(
+                    SyncEvent(
+                        level: .error,
+                        subsystem: "spotify",
+                        operation: "spotify.snapshotSource",
+                        runID: runContext.runID,
+                        trigger: runContext.trigger,
+                        message: failure.message,
+                        sourcePlaylistName: sourceReference.name,
+                        sourcePlaylistPersistentID: sourceReference.persistentID,
+                        errorCategory: failure.category,
+                        errorMessage: failure.underlyingMessage
+                    )
+                )
+                processedPlaylistCount += 1
+                continue
+            }
+
+            do {
+                let targetSummary: SpotifyPlaylistSummary
+                if mapping.spotifyPlaylistReference.isEmpty == false {
+                    targetSummary = try await spotifyClient.playlistSummary(
+                        reference: mapping.spotifyPlaylistReference,
+                        authConfig: spotifyAuth
+                    )
+                } else if let existingState = state.spotifyPlaylists[mapping.id] {
+                    targetSummary = try await spotifyClient.playlistSummary(
+                        reference: existingState.spotifyPlaylistID,
+                        authConfig: spotifyAuth
+                    )
+                } else {
+                    targetSummary = try await spotifyClient.createPlaylist(
+                        name: mapping.targetPlaylistName?.isEmpty == false ? mapping.targetPlaylistName! : sourceSnapshot.name,
+                        isPublic: false,
+                        authConfig: spotifyAuth
+                    )
+                    createdPlaylistCount += 1
+                }
+
+                let sourceURIs = try await resolveSpotifyTrackURIs(
+                    for: sourceSnapshot.tracks,
+                    authConfig: spotifyAuth
+                )
+                let currentTargetURIs = try await spotifyClient.playlistTrackURIs(
+                    playlistID: targetSummary.id,
+                    authConfig: spotifyAuth
+                )
+
+                let desiredFingerprint = fingerprint(for: sourceURIs.uris)
+                let currentTargetFingerprint = fingerprint(for: currentTargetURIs)
+                if desiredFingerprint != currentTargetFingerprint {
+                    try await spotifyClient.replacePlaylistContents(
+                        playlistID: targetSummary.id,
+                        uris: sourceURIs.uris,
+                        authConfig: spotifyAuth
+                    )
+                    writtenTrackCount += sourceURIs.uris.count
+                }
+
+                state.spotifyPlaylists[mapping.id] = SpotifyPlaylistState(
+                    mappingID: mapping.id,
+                    appleSourcePersistentID: sourceSnapshot.persistentID,
+                    appleSourceName: sourceSnapshot.name,
+                    spotifyPlaylistID: targetSummary.id,
+                    spotifyPlaylistName: targetSummary.name,
+                    lastSourceFingerprint: fingerprint(for: sourceSnapshot, desiredNames: [targetSummary.name]),
+                    lastTargetFingerprint: desiredFingerprint,
+                    lastSyncedAt: Date(),
+                    lastUnmatchedTracks: sourceURIs.unmatchedTrackLabels,
+                    lastError: nil,
+                    lastFailureCategory: nil,
+                    lastRunID: runContext.runID
+                )
+
+                if sourceURIs.unmatchedTrackLabels.isEmpty == false {
+                    await diagnostics.log(
+                        SyncEvent(
+                            level: .warning,
+                            subsystem: "spotify",
+                            operation: "spotify.unmatchedTracks",
+                            runID: runContext.runID,
+                            trigger: runContext.trigger,
+                            message: "Skipped \(sourceURIs.unmatchedTrackLabels.count) unmatched track(s) while syncing Spotify.",
+                            sourcePlaylistName: sourceSnapshot.name,
+                            sourcePlaylistPersistentID: sourceSnapshot.persistentID,
+                            targetPlaylistName: targetSummary.name,
+                            targetPlaylistPersistentID: targetSummary.id,
+                            metadata: [
+                                "unmatchedTracks": sourceURIs.unmatchedTrackLabels.prefix(5).joined(separator: ", "),
+                            ]
+                        )
+                    )
+                }
+
+                await diagnostics.log(
+                    SyncEvent(
+                        level: .info,
+                        subsystem: "spotify",
+                        operation: "spotify.syncPlaylist",
+                        runID: runContext.runID,
+                        trigger: runContext.trigger,
+                        message: currentTargetFingerprint == desiredFingerprint
+                            ? "Spotify playlist already matched the desired contents."
+                            : "Updated Spotify playlist contents.",
+                        sourcePlaylistName: sourceSnapshot.name,
+                        sourcePlaylistPersistentID: sourceSnapshot.persistentID,
+                        targetPlaylistName: targetSummary.name,
+                        targetPlaylistPersistentID: targetSummary.id,
+                        trackCount: sourceURIs.uris.count,
+                        writtenTrackCount: currentTargetFingerprint == desiredFingerprint ? 0 : sourceURIs.uris.count,
+                        metadata: [
+                            "unmatchedTrackCount": "\(sourceURIs.unmatchedTrackLabels.count)",
+                        ]
+                    )
+                )
+
+                lastCompletedStep = "Synced Spotify playlist \(targetSummary.name)"
+            } catch {
+                let failure = makeFailure(
+                    playlistName: sourceSnapshot.name,
+                    operation: "spotify.syncPlaylist",
+                    error: error,
+                    sourcePlaylistPersistentID: sourceSnapshot.persistentID
+                )
+                failures.append(failure)
+                state.spotifyPlaylists[mapping.id]?.lastError = failure.message
+                state.spotifyPlaylists[mapping.id]?.lastFailureCategory = failure.category
+                state.spotifyPlaylists[mapping.id]?.lastRunID = runContext.runID
+                await diagnostics.log(
+                    SyncEvent(
+                        level: .error,
+                        subsystem: "spotify",
+                        operation: "spotify.syncPlaylist",
+                        runID: runContext.runID,
+                        trigger: runContext.trigger,
+                        message: failure.message,
+                        sourcePlaylistName: sourceSnapshot.name,
+                        sourcePlaylistPersistentID: sourceSnapshot.persistentID,
+                        errorCategory: failure.category,
+                        errorMessage: failure.underlyingMessage
+                    )
+                )
+            }
+
+            processedPlaylistCount += 1
+        }
+
+        state.spotifyPlaylists = state.spotifyPlaylists.filter { activeSpotifyStateIDs.contains($0.key) }
+    }
+
+    private func resolveSpotifyTrackURIs(
+        for tracks: [TrackSnapshot],
+        authConfig: SpotifyAuthConfig
+    ) async throws -> (uris: [String], unmatchedTrackLabels: [String]) {
+        var resolvedURIs: [String] = []
+        var unmatchedLabels: [String] = []
+        var cache: [String: String?] = [:]
+
+        for track in tracks {
+            let cacheKey = [
+                track.isrc ?? "",
+                track.title,
+                track.artist,
+                track.album,
+            ].joined(separator: "\u{001F}")
+
+            let matchURI: String?
+            if let cached = cache[cacheKey] {
+                matchURI = cached
+            } else {
+                let resolved = try await spotifyClient.findBestTrackMatchURI(for: track, authConfig: authConfig)
+                cache[cacheKey] = resolved
+                matchURI = resolved
+            }
+
+            if let matchURI {
+                resolvedURIs.append(matchURI)
+            } else {
+                let fallbackLabel = [track.title, track.artist]
+                    .filter { !$0.isEmpty }
+                    .joined(separator: " — ")
+                unmatchedLabels.append(fallbackLabel.isEmpty ? track.persistentID : fallbackLabel)
+            }
+        }
+
+        return (resolvedURIs, unmatchedLabels)
     }
 }

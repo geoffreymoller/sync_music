@@ -456,6 +456,63 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Spotify") {
+                TextField("Client ID", text: spotifyClientIDBinding)
+                TextField("Redirect URI", text: spotifyRedirectURIBinding)
+
+                HStack {
+                    Button("Connect Spotify") {
+                        model.connectSpotify()
+                    }
+                    .disabled(model.hasPendingConfigChanges || !(model.config.spotifyAuth?.isConfigured ?? false))
+
+                    Button("Disconnect") {
+                        model.disconnectSpotify()
+                    }
+                    .disabled(model.spotifyConnectionStatus.isConnected == false)
+                }
+
+                if model.hasPendingConfigChanges {
+                    Text("Apply pending Spotify settings before connecting.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if model.spotifyConnectionStatus.isConnected {
+                    Text(
+                        model.spotifyConnectionStatus.accountDisplayName.map { "Connected as \($0)" }
+                            ?? model.spotifyConnectionStatus.accountID.map { "Connected as \($0)" }
+                            ?? "Connected to Spotify"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                } else {
+                    Text("Spotify is not connected.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Spotify mappings")
+                        .font(.caption.weight(.semibold))
+
+                    if model.draftConfig.spotifyPlaylistMappings.isEmpty {
+                        Text("No Spotify playlist mappings are configured. Add them in config.json.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(model.draftConfig.spotifyPlaylistMappings) { mapping in
+                            let targetReference = mapping.spotifyPlaylistReference.isEmpty
+                                ? (mapping.targetPlaylistName?.isEmpty == false ? "Create private mirror: \(mapping.targetPlaylistName!)" : "Create private mirror")
+                                : mapping.spotifyPlaylistReference
+                            Text("\(mapping.appleSourceName) (\(mapping.appleSourceKind.displayName)) → \(targetReference)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+
             Section("Pending Changes") {
                 HStack {
                     Button("Apply") {
@@ -494,7 +551,9 @@ struct SettingsView: View {
 
             Section("Notes") {
                 Text("Logs, last-run snapshots, and crash context are stored in ~/Library/Application Support/SyncMusic.")
-                Text("Soundiiz can only see regular playlists. SyncMusic keeps those playlists up to date from your smart playlists.")
+                Text("Spotify mappings are configured in config.json. Use an Apple playlist name plus a Spotify playlist URL/ID to adopt an existing target.")
+                Text("Direct Spotify sync runs on the same schedule as the app sync. Use an interval schedule for sub-daily updates.")
+                Text("Soundiiz can only see regular playlists. SyncMusic still keeps Apple mirror playlists up to date for that workflow.")
                 Text("Qobuz via Soundiiz uses 1,900 tracks per materialized part to stay below Qobuz limits.")
             }
             .font(.caption)
@@ -517,6 +576,32 @@ struct SettingsView: View {
                         let time = config.autoSyncSchedule.dailyTime ?? config.dailySyncTime
                         config.autoSyncSchedule = .daily(time: time.normalized)
                     }
+                }
+            }
+        )
+    }
+
+    private var spotifyClientIDBinding: Binding<String> {
+        Binding(
+            get: { model.draftConfig.spotifyAuth?.clientID ?? "" },
+            set: { newValue in
+                model.updateDraftConfig { config in
+                    var spotifyAuth = config.spotifyAuth ?? SpotifyAuthConfig()
+                    spotifyAuth.clientID = newValue
+                    config.spotifyAuth = spotifyAuth
+                }
+            }
+        )
+    }
+
+    private var spotifyRedirectURIBinding: Binding<String> {
+        Binding(
+            get: { model.draftConfig.spotifyAuth?.redirectURI ?? "http://127.0.0.1:43821/callback" },
+            set: { newValue in
+                model.updateDraftConfig { config in
+                    var spotifyAuth = config.spotifyAuth ?? SpotifyAuthConfig()
+                    spotifyAuth.redirectURI = newValue
+                    config.spotifyAuth = spotifyAuth
                 }
             }
         )

@@ -23,6 +23,7 @@ final class AppModel: ObservableObject {
     @Published var activeProgressStage: SyncProgressStage?
     @Published var activeProcessedPlaylistCount = 0
     @Published var activeCurrentPlaylistName: String?
+    @Published var spotifyConnectionStatus = SpotifyConnectionStatus(isConnected: false)
 
     private let engine: SyncEngine
     private var currentState = SyncState()
@@ -50,6 +51,7 @@ final class AppModel: ObservableObject {
             let loadedState = await engine.loadState()
             let lastSnapshot = await engine.loadLastRunSnapshot()
             let crashContext = await engine.loadCrashContext()
+            let spotifyStatus = await engine.spotifyConnectionStatus(config: loadedConfig)
 
             config = loadedConfig
             draftConfig = loadedConfig
@@ -57,6 +59,7 @@ final class AppModel: ObservableObject {
             applyState(loadedState)
             lastReport = lastSnapshot?.report
             recentFailures = Array(lastSnapshot?.report.failures.prefix(5) ?? [])
+            spotifyConnectionStatus = spotifyStatus
 
             if let lastSnapshot {
                 statusText = lastSnapshot.report.failures.isEmpty
@@ -108,6 +111,7 @@ final class AppModel: ObservableObject {
                 try await engine.saveConfig(normalized)
                 config = normalized
                 hasPendingConfigChanges = false
+                spotifyConnectionStatus = await engine.spotifyConnectionStatus(config: normalized)
 
                 if normalized.autoSyncSchedule != previousConfig.autoSyncSchedule {
                     restartScheduler(runStartupSync: false)
@@ -200,6 +204,44 @@ final class AppModel: ObservableObject {
                 pasteboard.clearContents()
                 pasteboard.setString(summary.text, forType: .string)
                 statusText = "Diagnostics summary copied."
+            }
+        }
+    }
+
+    func connectSpotify() {
+        guard hasPendingConfigChanges == false else {
+            statusText = "Apply pending Spotify settings before connecting."
+            return
+        }
+
+        guard let spotifyAuth = config.spotifyAuth, spotifyAuth.isConfigured else {
+            statusText = "Set a Spotify client ID and redirect URI first."
+            return
+        }
+
+        Task {
+            do {
+                let status = try await engine.connectSpotify(authConfig: spotifyAuth) { url in
+                    DispatchQueue.main.async {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+                spotifyConnectionStatus = status
+                statusText = status.accountDisplayName.map { "Connected Spotify as \($0)." } ?? "Connected Spotify."
+            } catch {
+                statusText = "Spotify connect failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func disconnectSpotify() {
+        Task {
+            do {
+                try await engine.disconnectSpotify(authConfig: config.spotifyAuth)
+                spotifyConnectionStatus = SpotifyConnectionStatus(isConnected: false)
+                statusText = "Disconnected Spotify."
+            } catch {
+                statusText = "Spotify disconnect failed: \(error.localizedDescription)"
             }
         }
     }
@@ -447,7 +489,7 @@ final class AppModel: ObservableObject {
         applyState(await engine.loadState())
 
         if report.failures.isEmpty {
-            statusText = "Last sync processed \(report.processedPlaylistCount) smart playlists."
+            statusText = "Last sync processed \(report.processedPlaylistCount) playlists."
             lastCompletedStepText = "Completed \(trigger.displayName.lowercased()) sync in \(report.durationMilliseconds) ms."
         } else {
             statusText = "Last sync finished with \(report.failures.count) issue(s)."
@@ -497,7 +539,28 @@ final class AppModel: ObservableObject {
         if normalized.materializedPrefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             normalized.materializedPrefix = "Sync Mirror"
         }
-        return normalized
+        let trimmedSpotifyAuth = normalized.spotifyAuth.map {
+            SpotifyAuthConfig(
+                clientID: $0.clientID,
+                redirectURI: $0.redirectURI
+            )
+        }
+
+        return AppConfig(
+            autoSyncSchedule: normalized.autoSyncSchedule,
+            materializedPrefix: normalized.materializedPrefix,
+            includeSystemSmartPlaylists: normalized.includeSystemSmartPlaylists,
+            sourcePlaylistExclusions: normalized.sourcePlaylistExclusions,
+            allowedSourcePlaylistNames: normalized.allowedSourcePlaylistNames,
+            providerProfile: normalized.providerProfile,
+            spotifyAuth: trimmedSpotifyAuth?.isConfigured == true ? trimmedSpotifyAuth : nil,
+            spotifyPlaylistMappings: normalized.spotifyPlaylistMappings,
+            deleteStaleManagedPlaylists: normalized.deleteStaleManagedPlaylists,
+            logLevel: normalized.logLevel,
+            debugLogging: normalized.debugLogging,
+            maxLogFileSizeBytes: normalized.maxLogFileSizeBytes,
+            maxRotatedLogFiles: normalized.maxRotatedLogFiles
+        )
     }
 
     private func installSchedulerObserversIfNeeded() {
